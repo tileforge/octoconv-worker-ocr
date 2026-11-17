@@ -221,7 +221,7 @@ func readTIFFDirectory(ra io.ReaderAt, size int64, bo binary.ByteOrder, ifdOffse
 }
 
 func pngDimensions(b []byte) (uint32, uint32, bool) {
-	if len(b) < 24 || !bytes.Equal(b[12:16], []byte("IHDR")) {
+	if len(b) < 24 || !bytes.Equal(b[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) || !bytes.Equal(b[12:16], []byte("IHDR")) {
 		return 0, 0, false
 	}
 	return binary.BigEndian.Uint32(b[16:20]), binary.BigEndian.Uint32(b[20:24]), true

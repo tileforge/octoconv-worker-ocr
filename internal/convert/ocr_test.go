@@ -687,6 +687,11 @@ func TestDeclaredDimensions(t *testing.T) {
 	if _, _, ok = pngDimensions([]byte("short")); ok {
 		t.Fatal("short png")
 	}
+	forged := pngIHDR(1, 1)
+	forged[0] = 'I'
+	if _, _, ok = pngDimensions(forged); ok {
+		t.Fatal("png without signature")
+	}
 	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x02, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x02, 0x00, 0x03}
 	w, h, ok = jpegDimensions(jpeg)
 	if !ok || w != 3 || h != 2 {
@@ -721,6 +726,38 @@ func TestDeclaredDimensions(t *testing.T) {
 	}
 	if HasDimensionLimit("heic") || HasDimensionLimit("pdf") {
 		t.Fatal("unexpected parser")
+	}
+}
+
+func TestPNGExtensionDoesNotTrustPlantedIHDR(t *testing.T) {
+	payload := tiffWithDirectoryAt(binary.LittleEndian, 32, 32, 64)
+	copy(payload[12:16], []byte("IHDR"))
+	binary.BigEndian.PutUint32(payload[16:20], 1)
+	binary.BigEndian.PutUint32(payload[20:24], 1)
+	if w, h, ok := pngDimensions(payload); ok {
+		t.Fatalf("png %d %d", w, h)
+	}
+	dir := t.TempDir()
+	pngPath := filepath.Join(dir, "page.png")
+	tiffPath := filepath.Join(dir, "page.tiff")
+	if err := os.WriteFile(pngPath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tiffPath, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enforceImagePixelBound(pngPath, 512); !errors.Is(err, ErrDimensionsUnknown) {
+		t.Fatalf("png: %v", err)
+	}
+	if err := enforceImagePixelBound(tiffPath, 512); !errors.Is(err, ErrOCRImageTooLarge) {
+		t.Fatalf("tiff: %v", err)
+	}
+	real := filepath.Join(dir, "real.png")
+	if err := os.WriteFile(real, pngIHDR(8, 8), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enforceImagePixelBound(real, 512); err != nil {
+		t.Fatal(err)
 	}
 }
 
