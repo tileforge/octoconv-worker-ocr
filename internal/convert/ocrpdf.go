@@ -92,24 +92,16 @@ func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir st
 
 func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFormat, configfile string) error {
 	jobDir := filepath.Dir(outPath)
-	guard, err := c.ocrPDFGuardStage(ctx, jobDir, inPath, targetFormat)
+	guard, err := c.ocrPDFGuardStage(ctx, jobDir, inPath)
 	if err != nil {
 		return err
 	}
-	if guard.done {
-		if len(guard.text) > c.outputLimit() {
-			return ErrOutputTooLarge
+	var tmpDir string
+	defer func() {
+		if tmpDir != "" {
+			os.RemoveAll(tmpDir)
 		}
-		if err := writeNewFile(outPath, guard.text, 0o644); err != nil {
-			return fmt.Errorf("ocr: write output: %w", err)
-		}
-		return validateOCROutput(outPath)
-	}
-	tmpDir, err := ocrPageWorkDir(outPath)
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpDir)
+	}()
 
 	var merger *ocrPageMerger
 	if configfile != "" {
@@ -122,6 +114,26 @@ func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFor
 		remain := limit - retained
 		if remain < 0 {
 			return ErrOutputTooLarge
+		}
+		if merger == nil {
+			text, err := c.exec(ctx, jobDir, "pdftotext", ocrTextLayerPageArgs(inPath, page)...)
+			if err != nil {
+				return fmt.Errorf("ocr: pdftotext: %w", err)
+			}
+			if hasUsableTextLayer(countNonWhitespace(text)) {
+				if len(text) > remain {
+					return ErrOutputTooLarge
+				}
+				retained += len(text)
+				textBuf.Write(text)
+				continue
+			}
+		}
+		if tmpDir == "" {
+			tmpDir, err = ocrPageWorkDir(outPath)
+			if err != nil {
+				return err
+			}
 		}
 		fragment, err := c.ocrPDFPage(ctx, jobDir, inPath, tmpDir, page, remain, configfile, targetFormat)
 		if err != nil {

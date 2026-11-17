@@ -59,8 +59,9 @@ func enforcePageBoxBound(widthPts, heightPts float64, dpi int, maxPixels uint64)
 	return nil
 }
 
-func ocrTextLayerArgs(pdfPath string) []string {
-	return []string{pdfPath, "-"}
+func ocrTextLayerPageArgs(pdfPath string, page int) []string {
+	p := strconv.Itoa(page)
+	return []string{"-f", p, "-l", p, pdfPath, "-"}
 }
 
 func countNonWhitespace(b []byte) int {
@@ -100,11 +101,9 @@ func enforceImagePixelBound(inPath string, maxPixels uint64) error {
 
 type ocrPDFGuardResult struct {
 	totalPages int
-	text       []byte
-	done       bool
 }
 
-func (c OCRConverter) ocrPDFGuardStage(ctx context.Context, jobDir, pdfPath, targetFormat string) (ocrPDFGuardResult, error) {
+func (c OCRConverter) ocrPDFGuardStage(ctx context.Context, jobDir, pdfPath string) (ocrPDFGuardResult, error) {
 	out, err := c.exec(ctx, jobDir, "pdfinfo", ocrPageCountArgs(pdfPath)...)
 	if err != nil {
 		return ocrPDFGuardResult{}, fmt.Errorf("ocr: pdfinfo: %w", err)
@@ -115,16 +114,6 @@ func (c OCRConverter) ocrPDFGuardStage(ctx context.Context, jobDir, pdfPath, tar
 	}
 	if err := enforceMaxPages(totalPages, c.MaxPages); err != nil {
 		return ocrPDFGuardResult{}, err
-	}
-	if targetFormat != "txt" {
-		return ocrPDFGuardResult{totalPages: totalPages}, nil
-	}
-	text, err := c.exec(ctx, jobDir, "pdftotext", ocrTextLayerArgs(pdfPath)...)
-	if err != nil {
-		return ocrPDFGuardResult{}, fmt.Errorf("ocr: pdftotext: %w", err)
-	}
-	if hasUsableTextLayer(countNonWhitespace(text)) {
-		return ocrPDFGuardResult{totalPages: totalPages, text: text, done: true}, nil
 	}
 	return ocrPDFGuardResult{totalPages: totalPages}, nil
 }

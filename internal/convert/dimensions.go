@@ -29,8 +29,11 @@ func HasDimensionLimit(format string) bool {
 
 func readDeclaredDimensions(format string, r io.Reader) (uint32, uint32, error) {
 	format = NormalizeFormat(format)
-	if format == "tiff" {
+	switch format {
+	case "tiff":
 		return readTIFFDimensions(r)
+	case "jpg":
+		return readJPEGDimensions(r)
 	}
 	buf := make([]byte, DimensionPeekBytes)
 	n, readErr := io.ReadFull(r, buf)
@@ -173,6 +176,100 @@ func webpDimensions(b []byte) (uint32, uint32, bool) {
 	default:
 		return 0, 0, false
 	}
+}
+
+func readAt(ra io.ReaderAt, buf []byte, off int64) error {
+	n, err := ra.ReadAt(buf, off)
+	if n == len(buf) {
+		return nil
+	}
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return io.ErrUnexpectedEOF
+}
+
+// A JPEG SOF marker can follow a comment larger than the 64 KiB prefix.
+// The walk uses each segment length and stops at the scan or the file size.
+func readJPEGDimensions(r io.Reader) (uint32, uint32, error) {
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	size, ok := readerSize(r)
+	if !ok || size < 4 {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	var soi [2]byte
+	if err := readAt(ra, soi[:], 0); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		return 0, 0, err
+	}
+	if soi[0] != 0xFF || soi[1] != 0xD8 {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	off := int64(2)
+	for off+1 < size {
+		var mark [4]byte
+		if err := readAt(ra, mark[:2], off); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return 0, 0, ErrDimensionsUnknown
+			}
+			return 0, 0, err
+		}
+		if mark[0] != 0xFF {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		marker := mark[1]
+		if marker == 0xFF {
+			off++
+			continue
+		}
+		if marker == 0x01 || marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) {
+			off += 2
+			continue
+		}
+		if marker == 0xD9 || marker == 0xDA {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		if off+4 > size {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		if err := readAt(ra, mark[:4], off); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return 0, 0, ErrDimensionsUnknown
+			}
+			return 0, 0, err
+		}
+		segLen := int64(mark[2])<<8 | int64(mark[3])
+		if segLen < 2 {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		isSOF := marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+		if isSOF {
+			if off+9 > size {
+				return 0, 0, ErrDimensionsUnknown
+			}
+			var sof [9]byte
+			if err := readAt(ra, sof[:], off); err != nil {
+				if errors.Is(err, io.ErrUnexpectedEOF) {
+					return 0, 0, ErrDimensionsUnknown
+				}
+				return 0, 0, err
+			}
+			height := uint32(sof[5])<<8 | uint32(sof[6])
+			width := uint32(sof[7])<<8 | uint32(sof[8])
+			return width, height, nil
+		}
+		next := off + 2 + segLen
+		if next < off || next > size {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		off = next
+	}
+	return 0, 0, ErrDimensionsUnknown
 }
 
 func jpegDimensions(b []byte) (uint32, uint32, bool) {

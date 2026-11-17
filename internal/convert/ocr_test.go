@@ -207,9 +207,9 @@ func TestPDFTextLayerSkipsTesseract(t *testing.T) {
 	c := pdfConverter(t, &names, func(name string, args []string) ([]byte, error) {
 		switch name {
 		case "pdfinfo":
-			return []byte("Pages: 4\n"), nil
+			return []byte("Pages: 1\n"), nil
 		case "pdftotext":
-			if len(args) != 2 || args[1] != "-" {
+			if !containsArg(args, "-f", "1") || !containsArg(args, "-l", "1") || args[len(args)-1] != "-" {
 				t.Fatalf("pdftotext %q", args)
 			}
 			return []byte(text), nil
@@ -228,6 +228,53 @@ func TestPDFTextLayerSkipsTesseract(t *testing.T) {
 		t.Fatalf("body %q %v", body, err)
 	}
 	if strings.Join(names, ",") != "pdfinfo,pdftotext" {
+		t.Fatalf("calls %v", names)
+	}
+}
+
+func TestMixedPDFOCRsPagesWithoutText(t *testing.T) {
+	cover := strings.Repeat("a", 17)
+	var names []string
+	c := pdfConverter(t, &names, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			if page := argAfter(args, "-f"); page != "" {
+				if page != "2" {
+					t.Fatalf("pdfinfo page %s", page)
+				}
+				return []byte("Page    2 size:  612 x 792 pts\n"), nil
+			}
+			return []byte("Pages: 2\n"), nil
+		case "pdftotext":
+			switch {
+			case containsArg(args, "-f", "1"):
+				return []byte(cover), nil
+			case containsArg(args, "-f", "2"):
+				return []byte("x"), nil
+			default:
+				t.Fatalf("pdftotext %q", args)
+				return nil, nil
+			}
+		case "pdftoppm":
+			assertSinglePage(t, args, 2)
+			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
+		case "tesseract":
+			return nil, os.WriteFile(args[1]+".txt", []byte("scan"), 0o644)
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil || string(body) != cover+"scan" {
+		t.Fatalf("body %q %v", body, err)
+	}
+	if strings.Join(names, ",") != "pdfinfo,pdftotext,pdftotext,pdfinfo,pdftoppm,tesseract" {
 		t.Fatalf("calls %v", names)
 	}
 }
@@ -602,6 +649,10 @@ func TestDeclaredDimensions(t *testing.T) {
 	if !ok || w != 3 || h != 2 {
 		t.Fatalf("jpeg %d %d %v", w, h, ok)
 	}
+	w, h, err := readDeclaredDimensions("jpg", bytes.NewReader(jpeg))
+	if err != nil || w != 3 || h != 2 {
+		t.Fatalf("jpeg reader %d %d %v", w, h, err)
+	}
 	webp := make([]byte, 30)
 	copy(webp[0:4], []byte("RIFF"))
 	copy(webp[8:12], []byte("WEBP"))
@@ -621,12 +672,43 @@ func TestDeclaredDimensions(t *testing.T) {
 	if !ok || w != 10 || h != 20 {
 		t.Fatalf("tiff %d %d %v", w, h, ok)
 	}
-	w, h, err := readDeclaredDimensions("tiff", bytes.NewReader(tiff))
+	w, h, err = readDeclaredDimensions("tiff", bytes.NewReader(tiff))
 	if err != nil || w != 10 || h != 20 {
 		t.Fatalf("tiff reader %d %d %v", w, h, err)
 	}
 	if HasDimensionLimit("heic") || HasDimensionLimit("pdf") {
 		t.Fatal("unexpected parser")
+	}
+}
+
+func TestJPEGDimensionsPastThePeek(t *testing.T) {
+	const comLen = 65533
+	buf := make([]byte, 2+2+comLen+9)
+	buf[0], buf[1] = 0xFF, 0xD8
+	buf[2], buf[3] = 0xFF, 0xFE
+	buf[4], buf[5] = 0xFF, 0xFD
+	sof := len(buf) - 9
+	copy(buf[sof:], []byte{0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10})
+	if sof <= DimensionPeekBytes {
+		t.Fatalf("sof at %d", sof)
+	}
+	if _, _, ok := jpegDimensions(buf[:DimensionPeekBytes]); ok {
+		t.Fatal("prefix holds no SOF")
+	}
+	w, h, err := readDeclaredDimensions("jpg", bytes.NewReader(buf))
+	if err != nil || w != 16 || h != 16 {
+		t.Fatalf("%d %d %v", w, h, err)
+	}
+	path := filepath.Join(t.TempDir(), "page.jpg")
+	if err := os.WriteFile(path, buf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enforceImagePixelBound(path, 100_000_000); err != nil {
+		t.Fatal(err)
+	}
+	short := []byte{0xFF, 0xD8, 0xFF, 0xFE, 0xFF, 0xFF}
+	if _, _, err := readDeclaredDimensions("jpg", bytes.NewReader(short)); !errors.Is(err, ErrDimensionsUnknown) {
+		t.Fatalf("truncated: %v", err)
 	}
 }
 
