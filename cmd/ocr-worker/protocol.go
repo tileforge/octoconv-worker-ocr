@@ -42,9 +42,10 @@ const (
 )
 
 var (
-	errOriginRejected   = errors.New("origin_rejected")
-	errSessionClosed    = errors.New("session_closed")
-	errAttemptNotActive = errors.New("attempt_not_active")
+	errOriginRejected    = errors.New("origin_rejected")
+	errSessionClosed     = errors.New("session_closed")
+	errAttemptNotActive  = errors.New("attempt_not_active")
+	errSessionTerminated = errors.New("terminate")
 )
 
 func ocrEngineCode(err error) string {
@@ -410,9 +411,9 @@ func (c *protocolClient) noteSessionClosed() {
 	if c.sessionErr == nil {
 		c.sessionErr = errSessionClosed
 	}
+	c.closeTermLocked()
 	run := c.active
 	c.mu.Unlock()
-	c.markTerminated()
 	if run == nil {
 		return
 	}
@@ -432,11 +433,13 @@ func (c *protocolClient) applyHeartbeat(ctrl controlJSON) {
 		c.draining = true
 	}
 	run := c.active
+	if ctrl.Terminate {
+		c.closeTermLocked()
+	}
 	c.mu.Unlock()
 	if ctrl.Terminate {
-		c.markTerminated()
 		if run != nil {
-			c.stopAttempt(run.parent, run.cancel, run.flag, run.asgn, "terminate", errors.New("terminate"))
+			c.stopAttempt(run.parent, run.cancel, run.flag, run.asgn, "terminate", errSessionTerminated)
 		}
 		return
 	}
@@ -451,6 +454,10 @@ func (c *protocolClient) applyHeartbeat(ctrl controlJSON) {
 func (c *protocolClient) markTerminated() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.closeTermLocked()
+}
+
+func (c *protocolClient) closeTermLocked() {
 	select {
 	case <-c.term:
 	default:
@@ -473,10 +480,19 @@ func (c *protocolClient) sessionDraining() bool {
 	return c.draining
 }
 
-func (c *protocolClient) setActive(run *liveAttempt) {
+func (c *protocolClient) setActive(run *liveAttempt) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.sessionErr != nil {
+		return c.sessionErr
+	}
+	select {
+	case <-c.term:
+		return errSessionTerminated
+	default:
+	}
 	c.active = run
-	c.mu.Unlock()
+	return nil
 }
 
 func (c *protocolClient) clearActive() {
@@ -681,7 +697,14 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	bounded, cancelDeadline := context.WithDeadline(ctx, deadline)
 	attemptCtx, cancelAttempt := context.WithCancelCause(bounded)
 	var flag stopFlag
-	c.setActive(&liveAttempt{asgn: asgn, parent: ctx, cancel: cancelAttempt, flag: &flag})
+	if err := c.setActive(&liveAttempt{asgn: asgn, parent: ctx, cancel: cancelAttempt, flag: &flag}); err != nil {
+		cancelAttempt(err)
+		cancelDeadline()
+		if errors.Is(err, errSessionClosed) {
+			return err
+		}
+		return c.postStopped(ctx, asgn, "terminate")
+	}
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -904,7 +927,7 @@ func (c *protocolClient) renewLoop(parent, attempt context.Context, cancelAttemp
 			}
 			if ctrl.Terminate {
 				c.markTerminated()
-				c.stopAttempt(parent, cancelAttempt, flag, asgn, "terminate", errors.New("terminate"))
+				c.stopAttempt(parent, cancelAttempt, flag, asgn, "terminate", errSessionTerminated)
 				return
 			}
 			if containsID(ctrl.CancelAttemptIDs, asgn.AttemptID) {

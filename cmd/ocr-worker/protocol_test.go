@@ -548,6 +548,37 @@ func TestHeartbeatLoopStopsAfterSessionClosed(t *testing.T) {
 	}
 }
 
+func TestSetActiveRefusesARecordedStop(t *testing.T) {
+	refused := func(t *testing.T, c *protocolClient, want error) {
+		t.Helper()
+		_, cancel := context.WithCancelCause(context.Background())
+		defer cancel(context.Canceled)
+		var flag stopFlag
+		err := c.setActive(&liveAttempt{
+			asgn:   assignmentJSON{AttemptID: "attempt"},
+			parent: context.Background(),
+			cancel: cancel,
+			flag:   &flag,
+		})
+		if !errors.Is(err, want) {
+			t.Fatalf("err %v", err)
+		}
+		c.mu.Lock()
+		active := c.active
+		c.mu.Unlock()
+		if active != nil || flag.outcome() != "" {
+			t.Fatalf("active %v outcome %s", active != nil, flag.outcome())
+		}
+	}
+	terminated := protocolTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil)
+	terminated.applyHeartbeat(controlJSON{Terminate: true})
+	refused(t, terminated, errSessionTerminated)
+
+	closed := protocolTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), nil)
+	closed.noteSessionClosed()
+	refused(t, closed, errSessionClosed)
+}
+
 func TestHeartbeatErrorLeavesTheAttemptRunning(t *testing.T) {
 	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -557,12 +588,14 @@ func TestHeartbeatErrorLeavesTheAttemptRunning(t *testing.T) {
 	attempt, cancel := context.WithCancelCause(context.Background())
 	defer cancel(context.Canceled)
 	var flag stopFlag
-	c.setActive(&liveAttempt{
+	if err := c.setActive(&liveAttempt{
 		asgn:   assignmentJSON{AttemptID: "attempt"},
 		parent: context.Background(),
 		cancel: cancel,
 		flag:   &flag,
-	})
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := c.postHeartbeat(context.Background(), []byte(`{"protocol_version":1}`)); err != nil {
 		t.Fatal(err)
 	}
