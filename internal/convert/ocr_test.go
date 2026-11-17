@@ -521,6 +521,51 @@ func TestMergedDocumentOverTheCeilingIsNotWritten(t *testing.T) {
 	}
 }
 
+func TestMergePrefixesDescendantIDs(t *testing.T) {
+	page := []byte(`<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<div class="ocr_page" id="page_1"><span class="ocrx_word" id="word_1_1">A &amp; B</span></div>
+</body></html>`)
+	m := newOCRPageMerger("hocr")
+	if err := m.AddPage(1, page); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AddPage(2, page); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Finalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(out)
+	if !strings.Contains(body, `id="p1_word_1_1"`) || !strings.Contains(body, `id="p2_word_1_1"`) || strings.Contains(body, `id="word_1_1"`) {
+		t.Fatalf("hocr ids:\n%s", body)
+	}
+	if !strings.Contains(body, "A &amp; B") || strings.Contains(body, "&amp;amp;") {
+		t.Fatalf("hocr escape:\n%s", body)
+	}
+
+	alto := []byte(`<alto xmlns="http://www.loc.gov/standards/alto/ns-v3#"><Layout>
+<Page ID="page_1"><TextLine ID="line_1" IDNEXT="line_2"><String ID="word_1" CONTENT="word_1" STYLEREFS="font_0"/></TextLine><TextLine ID="line_2"/></Page>
+</Layout></alto>`)
+	altoMerge := newOCRPageMerger("alto")
+	if err := altoMerge.AddPage(2, alto); err != nil {
+		t.Fatal(err)
+	}
+	out, err = altoMerge.Finalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = string(out)
+	for _, want := range []string{`ID="p2_line_1"`, `ID="p2_line_2"`, `ID="p2_word_1"`, `IDNEXT="p2_line_2"`, `CONTENT="word_1"`, `STYLEREFS="font_0"`} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("missing %s in\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, `ID="line_1"`) || strings.Contains(body, `ID="word_1"`) {
+		t.Fatalf("alto ids:\n%s", body)
+	}
+}
+
 func TestGoSourcesDoNotNameLandlock(t *testing.T) {
 	root := filepath.Join("..", "..")
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {

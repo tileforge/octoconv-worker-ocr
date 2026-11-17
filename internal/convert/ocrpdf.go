@@ -225,9 +225,145 @@ func (m *ocrPageMerger) AddPage(pageNum int, fragment []byte) error {
 			return fmt.Errorf("ocr: merge: page %d: decode page element: %w", pageNum, err)
 		}
 		node.Attrs = setOCRAttr(node.Attrs, ocrPageIDAttr(m.target), "page_"+strconv.Itoa(pageNum))
+		inner, err := rewriteDescendantIDs(pageNum, node.Inner)
+		if err != nil {
+			return fmt.Errorf("ocr: merge: page %d: %w", pageNum, err)
+		}
+		node.Inner = inner
 		m.pages = append(m.pages, node)
 		return nil
 	}
+}
+
+// tesseract starts block, line, and word ids at 1 on every single-page run.
+func rewriteDescendantIDs(pageNum int, inner string) (string, error) {
+	if strings.TrimSpace(inner) == "" {
+		return inner, nil
+	}
+	dec := xml.NewDecoder(strings.NewReader("<ocrfrag>" + inner + "</ocrfrag>"))
+	var toks []fragToken
+	depth := 0
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			if depth == 0 && t.Name.Local == "ocrfrag" {
+				depth++
+				continue
+			}
+			depth++
+			toks = append(toks, fragToken{kind: 's', start: t.Copy()})
+		case xml.EndElement:
+			depth--
+			if depth == 0 && t.Name.Local == "ocrfrag" {
+				continue
+			}
+			toks = append(toks, fragToken{kind: 'e', end: t})
+		case xml.CharData:
+			toks = append(toks, fragToken{kind: 'c', data: append([]byte(nil), t...)})
+		case xml.Comment:
+			toks = append(toks, fragToken{kind: 'm', data: append([]byte(nil), t...)})
+		case xml.Directive:
+			toks = append(toks, fragToken{kind: 'd', data: append([]byte(nil), t...)})
+		}
+	}
+	ids := map[string]struct{}{}
+	for _, tok := range toks {
+		if tok.kind != 's' {
+			continue
+		}
+		for _, attr := range tok.start.Attr {
+			if isOCRIDAttr(attr.Name.Local) && attr.Value != "" {
+				ids[attr.Value] = struct{}{}
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return inner, nil
+	}
+	prefix := "p" + strconv.Itoa(pageNum) + "_"
+	for i := range toks {
+		if toks[i].kind != 's' {
+			continue
+		}
+		for j := range toks[i].start.Attr {
+			attr := &toks[i].start.Attr[j]
+			if isOCRIDAttr(attr.Name.Local) {
+				if _, ok := ids[attr.Value]; ok {
+					attr.Value = prefix + attr.Value
+				}
+				continue
+			}
+			if isOCRIDRefAttr(attr.Name.Local) {
+				attr.Value = rewriteIDRefs(attr.Value, ids, prefix)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	enc := xml.NewEncoder(&buf)
+	for _, tok := range toks {
+		var err error
+		switch tok.kind {
+		case 's':
+			err = enc.EncodeToken(tok.start)
+		case 'e':
+			err = enc.EncodeToken(tok.end)
+		case 'c':
+			err = enc.EncodeToken(xml.CharData(tok.data))
+		case 'm':
+			err = enc.EncodeToken(xml.Comment(tok.data))
+		case 'd':
+			err = enc.EncodeToken(xml.Directive(tok.data))
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	if err := enc.Flush(); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+type fragToken struct {
+	kind  byte
+	start xml.StartElement
+	end   xml.EndElement
+	data  []byte
+}
+
+func isOCRIDAttr(local string) bool {
+	return local == "id" || local == "ID"
+}
+
+func isOCRIDRefAttr(local string) bool {
+	switch local {
+	case "IDNEXT", "IDPREV", "STYLEREFS", "TAGREFS", "PROCESSINGREFS":
+		return true
+	default:
+		return false
+	}
+}
+
+func rewriteIDRefs(value string, ids map[string]struct{}, prefix string) string {
+	fields := strings.Fields(value)
+	changed := false
+	for i, field := range fields {
+		if _, ok := ids[field]; ok {
+			fields[i] = prefix + field
+			changed = true
+		}
+	}
+	if !changed {
+		return value
+	}
+	return strings.Join(fields, " ")
 }
 
 const (
