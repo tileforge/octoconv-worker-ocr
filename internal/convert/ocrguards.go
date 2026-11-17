@@ -88,6 +88,13 @@ func enforceImagePixelBound(inPath string, maxPixels uint64) error {
 		return fmt.Errorf("ocr: open %q: %w", inPath, err)
 	}
 	defer f.Close()
+	if format == "tiff" {
+		err := enforceTIFFPixelBound(f, maxPixels)
+		if err == nil || errors.Is(err, ErrOCRImageTooLarge) {
+			return err
+		}
+		return fmt.Errorf("ocr: %w", err)
+	}
 	width, height, err := readDeclaredDimensions(format, f)
 	if err != nil {
 		return fmt.Errorf("ocr: %w", err)

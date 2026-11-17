@@ -208,6 +208,62 @@ func ocrPageIDAttr(target string) string {
 	return "id"
 }
 
+// tesseract starts ppageno and PHYSICAL_IMG_NR at 0 on every single-page run.
+func setOCRPhysicalPage(target string, attrs []xml.Attr, pageNum int) []xml.Attr {
+	switch target {
+	case "alto":
+		return setOCRAttr(attrs, "PHYSICAL_IMG_NR", strconv.Itoa(pageNum))
+	case "hocr":
+		return rewriteHOCRPageNumber(attrs, pageNum)
+	default:
+		return attrs
+	}
+}
+
+func rewriteHOCRPageNumber(attrs []xml.Attr, pageNum int) []xml.Attr {
+	for i, attr := range attrs {
+		if attr.Name.Local != "title" {
+			continue
+		}
+		attrs[i].Value = replaceHOCRPageNumber(attr.Value, pageNum)
+	}
+	return attrs
+}
+
+func replaceHOCRPageNumber(title string, pageNum int) string {
+	parts := strings.Split(title, ";")
+	changed := false
+	for i, part := range parts {
+		raw := strings.TrimSpace(part)
+		if !strings.HasPrefix(raw, "ppageno") {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(raw, "ppageno"))
+		if rest == "" || !digitsOnly(rest) {
+			continue
+		}
+		pad := part[:len(part)-len(strings.TrimLeft(part, " \t"))]
+		parts[i] = pad + "ppageno " + strconv.Itoa(pageNum)
+		changed = true
+	}
+	if !changed {
+		return title
+	}
+	return strings.Join(parts, ";")
+}
+
+func digitsOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
 func setOCRAttr(attrs []xml.Attr, local, value string) []xml.Attr {
 	for i, a := range attrs {
 		if a.Name.Local == local {
@@ -237,6 +293,7 @@ func (m *ocrPageMerger) AddPage(pageNum int, fragment []byte) error {
 			return fmt.Errorf("ocr: merge: page %d: decode page element: %w", pageNum, err)
 		}
 		node.Attrs = setOCRAttr(node.Attrs, ocrPageIDAttr(m.target), "page_"+strconv.Itoa(pageNum))
+		node.Attrs = setOCRPhysicalPage(m.target, node.Attrs, pageNum)
 		inner, err := rewriteDescendantIDs(pageNum, node.Inner)
 		if err != nil {
 			return fmt.Errorf("ocr: merge: page %d: %w", pageNum, err)

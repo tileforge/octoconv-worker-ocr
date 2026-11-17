@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 )
@@ -86,6 +87,84 @@ func readTIFFDimensions(r io.Reader) (uint32, uint32, error) {
 		return 0, 0, ErrDimensionsUnknown
 	}
 	return w, h, nil
+}
+
+// A later IFD can describe a much larger page than the first. The next-IFD
+// offset is followed until it is zero. A repeated offset is rejected, and the
+// walk stops at maxTIFFIFDs so a crafted chain cannot run without a bound.
+const maxTIFFIFDs = 4096
+
+func enforceTIFFPixelBound(r io.Reader, maxPixels uint64) error {
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return ErrDimensionsUnknown
+	}
+	size, ok := readerSize(r)
+	if !ok || size < 8 {
+		return ErrDimensionsUnknown
+	}
+	var header [8]byte
+	if err := readAt(ra, header[:], 0); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return ErrDimensionsUnknown
+		}
+		return err
+	}
+	bo, ifdOffset, ok := tiffHeader(header[:])
+	if !ok {
+		return ErrDimensionsUnknown
+	}
+	seen := map[uint64]struct{}{}
+	for page := 1; ifdOffset != 0; page++ {
+		if page > maxTIFFIFDs {
+			return ErrDimensionsUnknown
+		}
+		if _, ok := seen[ifdOffset]; ok {
+			return ErrDimensionsUnknown
+		}
+		seen[ifdOffset] = struct{}{}
+		dir, ok, err := readTIFFDirectory(ra, size, bo, ifdOffset)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrDimensionsUnknown
+		}
+		w, h, found := tiffIFDDimensions(bo, dir)
+		if !found {
+			return ErrDimensionsUnknown
+		}
+		pixels := uint64(w) * uint64(h)
+		if maxPixels > 0 && pixels > maxPixels {
+			return fmt.Errorf("%w: declared %dx%d (%d pixels) exceeds bound %d", ErrOCRImageTooLarge, w, h, pixels, maxPixels)
+		}
+		next, ok, err := readTIFFNextIFD(ra, size, bo, ifdOffset+uint64(len(dir)))
+		if err != nil {
+			return err
+		}
+		if !ok || next == 0 {
+			return nil
+		}
+		ifdOffset = next
+	}
+	if len(seen) == 0 {
+		return ErrDimensionsUnknown
+	}
+	return nil
+}
+
+func readTIFFNextIFD(ra io.ReaderAt, size int64, bo binary.ByteOrder, off uint64) (uint64, bool, error) {
+	if off > uint64(size) || uint64(size)-off < 4 {
+		return 0, false, nil
+	}
+	var buf [4]byte
+	if err := readAt(ra, buf[:], int64(off)); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return uint64(bo.Uint32(buf[:])), true, nil
 }
 
 func readerSize(r io.Reader) (int64, bool) {

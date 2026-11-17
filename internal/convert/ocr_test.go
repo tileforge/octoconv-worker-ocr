@@ -613,6 +613,49 @@ func TestMergePrefixesDescendantIDs(t *testing.T) {
 	}
 }
 
+func TestMergeUpdatesPhysicalPageNumbers(t *testing.T) {
+	hocr := []byte(`<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<div class="ocr_page" id="page_1" title="image &quot;scan ppageno 9&quot;; bbox 0 0 10 10; ppageno 0"><span class="ocrx_word" id="word_1">ppageno 0</span></div>
+</body></html>`)
+	m := newOCRPageMerger("hocr")
+	if err := m.AddPage(1, hocr); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.AddPage(2, hocr); err != nil {
+		t.Fatal(err)
+	}
+	out, err := m.Finalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(out)
+	if strings.Contains(body, "ppageno 0\"") || strings.Contains(body, "ppageno 0;") || !strings.Contains(body, "ppageno 1") || !strings.Contains(body, "ppageno 2") {
+		t.Fatalf("hocr pages:\n%s", body)
+	}
+	if !strings.Contains(body, "scan ppageno 9") || !strings.Contains(body, ">ppageno 0<") {
+		t.Fatalf("hocr text:\n%s", body)
+	}
+
+	alto := []byte(`<alto xmlns="http://www.loc.gov/standards/alto/ns-v3#"><Layout>
+<Page ID="page_1" PHYSICAL_IMG_NR="0"><String ID="word_1" CONTENT="0" STYLEREFS="font_0"/></Page>
+</Layout></alto>`)
+	altoMerge := newOCRPageMerger("alto")
+	if err := altoMerge.AddPage(2, alto); err != nil {
+		t.Fatal(err)
+	}
+	out, err = altoMerge.Finalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	body = string(out)
+	if !strings.Contains(body, `PHYSICAL_IMG_NR="2"`) || strings.Contains(body, `PHYSICAL_IMG_NR="0"`) {
+		t.Fatalf("alto page:\n%s", body)
+	}
+	if !strings.Contains(body, `CONTENT="0"`) || !strings.Contains(body, `STYLEREFS="font_0"`) {
+		t.Fatalf("alto text:\n%s", body)
+	}
+}
+
 func TestGoSourcesDoNotNameLandlock(t *testing.T) {
 	root := filepath.Join("..", "..")
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
@@ -737,6 +780,54 @@ func TestTIFFDirectoryPastThePeek(t *testing.T) {
 	if err := enforceImagePixelBound(path, 10); !errors.Is(err, ErrOCRImageTooLarge) {
 		t.Fatalf("bound: %v", err)
 	}
+}
+
+func TestTIFFLaterPageIsBounded(t *testing.T) {
+	payload := tiffPages(binary.LittleEndian, [][2]uint32{{16, 16}, {32, 32}})
+	err := enforceTIFFPixelBound(bytes.NewReader(payload), 512)
+	if !errors.Is(err, ErrOCRImageTooLarge) {
+		t.Fatalf("bound: %v", err)
+	}
+	if err := enforceTIFFPixelBound(bytes.NewReader(payload), 1024); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "pages.tiff")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enforceImagePixelBound(path, 512); !errors.Is(err, ErrOCRImageTooLarge) {
+		t.Fatalf("file: %v", err)
+	}
+
+	cycle := tiffPages(binary.LittleEndian, [][2]uint32{{16, 16}})
+	binary.LittleEndian.PutUint32(cycle[8+26:], 8)
+	if err := enforceTIFFPixelBound(bytes.NewReader(cycle), 1000); !errors.Is(err, ErrDimensionsUnknown) {
+		t.Fatalf("cycle: %v", err)
+	}
+}
+
+func tiffPages(bo binary.ByteOrder, pages [][2]uint32) []byte {
+	const ifdLen = 2 + 2*12 + 4
+	buf := make([]byte, 8+len(pages)*ifdLen)
+	if bo == binary.LittleEndian {
+		buf[0], buf[1] = 'I', 'I'
+	} else {
+		buf[0], buf[1] = 'M', 'M'
+	}
+	bo.PutUint16(buf[2:4], 42)
+	bo.PutUint32(buf[4:8], 8)
+	for i, page := range pages {
+		at := 8 + i*ifdLen
+		bo.PutUint16(buf[at:at+2], 2)
+		putTIFFEntry(bo, buf[at+2:], 256, 3, page[0])
+		putTIFFEntry(bo, buf[at+14:], 257, 3, page[1])
+		next := uint32(0)
+		if i+1 < len(pages) {
+			next = uint32(at + ifdLen)
+		}
+		bo.PutUint32(buf[at+26:at+30], next)
+	}
+	return buf
 }
 
 func TestTIFFDirectoryPastTheFileFailsClosed(t *testing.T) {
