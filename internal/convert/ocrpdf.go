@@ -210,13 +210,16 @@ func ocrPageIDAttr(target string) string {
 	return "id"
 }
 
-// tesseract starts ppageno and PHYSICAL_IMG_NR at 0 on every single-page run.
+// hOCR ppageno starts at zero. ALTO PHYSICAL_IMG_NR follows the one-based page id.
 func setOCRPhysicalPage(target string, attrs []xml.Attr, pageNum int) []xml.Attr {
 	switch target {
 	case "alto":
 		return setOCRAttr(attrs, "PHYSICAL_IMG_NR", strconv.Itoa(pageNum))
 	case "hocr":
-		return rewriteHOCRPageNumber(attrs, pageNum)
+		if pageNum < 1 {
+			return attrs
+		}
+		return rewriteHOCRPageNumber(attrs, pageNum-1)
 	default:
 		return attrs
 	}

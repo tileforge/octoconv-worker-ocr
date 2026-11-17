@@ -629,8 +629,11 @@ func TestMergeUpdatesPhysicalPageNumbers(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(out)
-	if strings.Contains(body, "ppageno 0\"") || strings.Contains(body, "ppageno 0;") || !strings.Contains(body, "ppageno 1") || !strings.Contains(body, "ppageno 2") {
+	if !strings.Contains(body, `ppageno 0"`) || !strings.Contains(body, `ppageno 1"`) || strings.Contains(body, "ppageno 2") {
 		t.Fatalf("hocr pages:\n%s", body)
+	}
+	if !strings.Contains(body, `id="page_1"`) || !strings.Contains(body, `id="page_2"`) {
+		t.Fatalf("hocr ids:\n%s", body)
 	}
 	if !strings.Contains(body, "scan ppageno 9") || !strings.Contains(body, ">ppageno 0<") {
 		t.Fatalf("hocr text:\n%s", body)
