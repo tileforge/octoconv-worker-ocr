@@ -5,11 +5,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"io/fs"
 )
 
 const DimensionPeekBytes = 64 * 1024
 
-// ErrDimensionsUnknown means the declared width and height were not in the peeked prefix.
+// ErrDimensionsUnknown means the declared width and height could not be read.
 var ErrDimensionsUnknown = errors.New("cannot determine declared image dimensions")
 
 type dimensionParser func(buf []byte) (width, height uint32, ok bool)
@@ -27,13 +28,17 @@ func HasDimensionLimit(format string) bool {
 }
 
 func readDeclaredDimensions(format string, r io.Reader) (uint32, uint32, error) {
+	format = NormalizeFormat(format)
+	if format == "tiff" {
+		return readTIFFDimensions(r)
+	}
 	buf := make([]byte, DimensionPeekBytes)
 	n, readErr := io.ReadFull(r, buf)
 	if readErr != nil && readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
 		return 0, 0, readErr
 	}
 	buf = buf[:n]
-	parser, ok := dimensionParsers[NormalizeFormat(format)]
+	parser, ok := dimensionParsers[format]
 	if !ok {
 		return 0, 0, ErrDimensionsUnknown
 	}
@@ -42,6 +47,95 @@ func readDeclaredDimensions(format string, r io.Reader) (uint32, uint32, error) 
 		return 0, 0, ErrDimensionsUnknown
 	}
 	return w, h, nil
+}
+
+// The first IFD offset is in the header and is often past the image data.
+// The read stops at the file size, which is capped at MaxFileBytes.
+func readTIFFDimensions(r io.Reader) (uint32, uint32, error) {
+	ra, ok := r.(io.ReaderAt)
+	if !ok {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	size, ok := readerSize(r)
+	if !ok || size < 8 {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	var header [8]byte
+	if _, err := ra.ReadAt(header[:], 0); err != nil {
+		if errors.Is(err, io.EOF) {
+			return 0, 0, ErrDimensionsUnknown
+		}
+		return 0, 0, err
+	}
+	bo, ifdOffset, ok := tiffHeader(header[:])
+	if !ok {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	dir, ok, err := readTIFFDirectory(ra, size, bo, ifdOffset)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !ok {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	w, h, found := tiffIFDDimensions(bo, dir)
+	if !found {
+		return 0, 0, ErrDimensionsUnknown
+	}
+	return w, h, nil
+}
+
+func readerSize(r io.Reader) (int64, bool) {
+	type stater interface {
+		Stat() (fs.FileInfo, error)
+	}
+	if s, ok := r.(stater); ok {
+		info, err := s.Stat()
+		if err != nil || !info.Mode().IsRegular() {
+			return 0, false
+		}
+		return boundedSize(info.Size())
+	}
+	type sizer interface {
+		Size() int64
+	}
+	if s, ok := r.(sizer); ok {
+		return boundedSize(s.Size())
+	}
+	return 0, false
+}
+
+func boundedSize(size int64) (int64, bool) {
+	if size < 0 || size > MaxFileBytes {
+		return 0, false
+	}
+	return size, true
+}
+
+func readTIFFDirectory(ra io.ReaderAt, size int64, bo binary.ByteOrder, ifdOffset uint64) ([]byte, bool, error) {
+	if ifdOffset > uint64(size) || uint64(size)-ifdOffset < 2 {
+		return nil, false, nil
+	}
+	var countBuf [2]byte
+	if _, err := ra.ReadAt(countBuf[:], int64(ifdOffset)); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	count := uint64(bo.Uint16(countBuf[:]))
+	dirLen := 2 + count*12
+	if dirLen > uint64(size)-ifdOffset {
+		return nil, false, nil
+	}
+	dir := make([]byte, dirLen)
+	if _, err := ra.ReadAt(dir, int64(ifdOffset)); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return dir, true, nil
 }
 
 func pngDimensions(b []byte) (uint32, uint32, bool) {
@@ -128,9 +222,9 @@ func jpegDimensions(b []byte) (uint32, uint32, bool) {
 	return 0, 0, false
 }
 
-func tiffDimensions(b []byte) (uint32, uint32, bool) {
+func tiffHeader(b []byte) (binary.ByteOrder, uint64, bool) {
 	if len(b) < 8 {
-		return 0, 0, false
+		return nil, 0, false
 	}
 	var bo binary.ByteOrder
 	switch {
@@ -139,32 +233,50 @@ func tiffDimensions(b []byte) (uint32, uint32, bool) {
 	case bytes.Equal(b[0:2], []byte{0x4D, 0x4D}):
 		bo = binary.BigEndian
 	default:
+		return nil, 0, false
+	}
+	if bo.Uint16(b[2:4]) != 42 {
+		return nil, 0, false
+	}
+	return bo, uint64(bo.Uint32(b[4:8])), true
+}
+
+func tiffDimensions(b []byte) (uint32, uint32, bool) {
+	bo, ifdOffset, ok := tiffHeader(b)
+	if !ok || ifdOffset > uint64(len(b)) || uint64(len(b))-ifdOffset < 2 {
 		return 0, 0, false
 	}
-	ifdOffset := bo.Uint32(b[4:8])
-	if uint64(ifdOffset)+2 > uint64(len(b)) {
+	count := uint64(bo.Uint16(b[ifdOffset : ifdOffset+2]))
+	dirLen := 2 + count*12
+	if dirLen > uint64(len(b))-ifdOffset {
 		return 0, 0, false
 	}
-	count := bo.Uint16(b[ifdOffset : ifdOffset+2])
-	entriesStart := ifdOffset + 2
+	return tiffIFDDimensions(bo, b[ifdOffset:ifdOffset+dirLen])
+}
+
+func tiffIFDDimensions(bo binary.ByteOrder, dir []byte) (uint32, uint32, bool) {
+	if len(dir) < 2 {
+		return 0, 0, false
+	}
+	count := uint32(bo.Uint16(dir[0:2]))
 	var width, height uint32
 	var foundW, foundH bool
-	for i := uint32(0); i < uint32(count); i++ {
-		off := entriesStart + i*12
-		if uint64(off)+12 > uint64(len(b)) {
+	for i := uint32(0); i < count; i++ {
+		off := 2 + i*12
+		if uint64(off)+12 > uint64(len(dir)) {
 			return 0, 0, false
 		}
-		tag := bo.Uint16(b[off : off+2])
+		tag := bo.Uint16(dir[off : off+2])
 		if tag != 256 && tag != 257 {
 			continue
 		}
-		typ := bo.Uint16(b[off+2 : off+4])
+		typ := bo.Uint16(dir[off+2 : off+4])
 		var val uint32
 		switch typ {
 		case 3:
-			val = uint32(bo.Uint16(b[off+8 : off+10]))
+			val = uint32(bo.Uint16(dir[off+8 : off+10]))
 		case 4:
-			val = bo.Uint32(b[off+8 : off+12])
+			val = bo.Uint32(dir[off+8 : off+12])
 		default:
 			continue
 		}

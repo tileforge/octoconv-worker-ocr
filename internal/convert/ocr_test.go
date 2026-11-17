@@ -621,9 +621,88 @@ func TestDeclaredDimensions(t *testing.T) {
 	if !ok || w != 10 || h != 20 {
 		t.Fatalf("tiff %d %d %v", w, h, ok)
 	}
+	w, h, err := readDeclaredDimensions("tiff", bytes.NewReader(tiff))
+	if err != nil || w != 10 || h != 20 {
+		t.Fatalf("tiff reader %d %d %v", w, h, err)
+	}
 	if HasDimensionLimit("heic") || HasDimensionLimit("pdf") {
 		t.Fatal("unexpected parser")
 	}
+}
+
+func TestTIFFDirectoryPastThePeek(t *testing.T) {
+	for _, bo := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		payload := tiffWithDirectoryAt(bo, 256, 256, 65544)
+		if len(payload) <= DimensionPeekBytes {
+			t.Fatalf("fixture length %d", len(payload))
+		}
+		if _, _, ok := tiffDimensions(payload[:DimensionPeekBytes]); ok {
+			t.Fatal("prefix holds no directory")
+		}
+		w, h, err := readDeclaredDimensions("tiff", bytes.NewReader(payload))
+		if err != nil || w != 256 || h != 256 {
+			t.Fatalf("%T: %d %d %v", bo, w, h, err)
+		}
+	}
+	payload := tiffWithDirectoryAt(binary.LittleEndian, 256, 256, 65544)
+	path := filepath.Join(t.TempDir(), "page.tiff")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := enforceImagePixelBound(path, 100_000_000); err != nil {
+		t.Fatal(err)
+	}
+	if err := enforceImagePixelBound(path, 10); !errors.Is(err, ErrOCRImageTooLarge) {
+		t.Fatalf("bound: %v", err)
+	}
+}
+
+func TestTIFFDirectoryPastTheFileFailsClosed(t *testing.T) {
+	short := make([]byte, 8)
+	short[0], short[1] = 'I', 'I'
+	binary.LittleEndian.PutUint16(short[2:4], 42)
+	binary.LittleEndian.PutUint32(short[4:8], 65544)
+	_, _, err := readDeclaredDimensions("tiff", bytes.NewReader(short))
+	if !errors.Is(err, ErrDimensionsUnknown) {
+		t.Fatalf("offset: %v", err)
+	}
+
+	trunc := make([]byte, 10)
+	trunc[0], trunc[1] = 'I', 'I'
+	binary.LittleEndian.PutUint16(trunc[2:4], 42)
+	binary.LittleEndian.PutUint32(trunc[4:8], 8)
+	binary.LittleEndian.PutUint16(trunc[8:10], 10)
+	_, _, err = readDeclaredDimensions("tiff", bytes.NewReader(trunc))
+	if !errors.Is(err, ErrDimensionsUnknown) {
+		t.Fatalf("count: %v", err)
+	}
+}
+
+func tiffWithDirectoryAt(bo binary.ByteOrder, width, height uint32, ifdAt int) []byte {
+	const dirLen = 2 + 2*12
+	buf := make([]byte, ifdAt+dirLen)
+	if bo == binary.LittleEndian {
+		buf[0], buf[1] = 'I', 'I'
+	} else {
+		buf[0], buf[1] = 'M', 'M'
+	}
+	bo.PutUint16(buf[2:4], 42)
+	bo.PutUint32(buf[4:8], uint32(ifdAt))
+	bo.PutUint16(buf[ifdAt:ifdAt+2], 2)
+	putTIFFEntry(bo, buf[ifdAt+2:], 256, 3, width)
+	putTIFFEntry(bo, buf[ifdAt+14:], 257, 3, height)
+	return buf
+}
+
+func putTIFFEntry(bo binary.ByteOrder, b []byte, tag, typ uint16, value uint32) {
+	bo.PutUint16(b[0:2], tag)
+	bo.PutUint16(b[2:4], typ)
+	bo.PutUint32(b[4:8], 1)
+	if typ == 3 {
+		bo.PutUint16(b[8:10], uint16(value))
+		return
+	}
+	bo.PutUint32(b[8:12], value)
 }
 
 func pdfConverter(t *testing.T, names *[]string, fn func(name string, args []string) ([]byte, error)) OCRConverter {
