@@ -1,0 +1,543 @@
+package convert
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestPairsMatchManifest(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "schema", "manifest-ocr-convert.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Capabilities []struct {
+			Formats []Pair `json:"formats"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	got := (OCRConverter{}).Pairs()
+	if len(doc.Capabilities) != 1 || len(got) != 15 || len(doc.Capabilities[0].Formats) != len(got) {
+		t.Fatalf("pairs %d manifest %d", len(got), len(doc.Capabilities[0].Formats))
+	}
+	for i, pair := range got {
+		want := doc.Capabilities[0].Formats[i]
+		if pair != want {
+			t.Fatalf("pair %d %+v want %+v", i, pair, want)
+		}
+		if _, ok := Default.LookupOp(OperationConvert, pair.From, pair.To); !ok {
+			t.Fatalf("lookup %s to %s", pair.From, pair.To)
+		}
+	}
+}
+
+func TestLimits(t *testing.T) {
+	if MaxFileBytes != 100<<20 {
+		t.Fatalf("max file %d", MaxFileBytes)
+	}
+	if DefaultEngineTimeout.Seconds() != 744 {
+		t.Fatalf("timeout %s", DefaultEngineTimeout)
+	}
+	if DefaultMaxPages != 200 || DefaultMaxImagePixels != 100_000_000 {
+		t.Fatalf("caps %d %d", DefaultMaxPages, DefaultMaxImagePixels)
+	}
+	cur := Current()
+	if cur.MaxPages != DefaultMaxPages || cur.MaxImagePixels != uint64(DefaultMaxImagePixels) {
+		t.Fatalf("registered %+v", cur)
+	}
+}
+
+func TestMIMETypes(t *testing.T) {
+	want := map[string]string{
+		"txt":  "text/plain",
+		"hocr": "text/html",
+		"alto": "application/xml",
+		"jpg":  "image/jpeg",
+		"jpeg": "image/jpeg",
+		"png":  "image/png",
+		"webp": "image/webp",
+		"tiff": "image/tiff",
+		"tif":  "image/tiff",
+		"pdf":  "application/pdf",
+	}
+	for format, mime := range want {
+		if got := MIMEType(format); got != mime {
+			t.Errorf("%s %s", format, got)
+		}
+	}
+}
+
+func TestEngineEnvPassesTesseractVariables(t *testing.T) {
+	prev := ocrThreads
+	t.Cleanup(func() { ocrThreads = prev })
+	t.Setenv("TESSDATA_PREFIX", "/tess")
+	t.Setenv("OMP_THREAD_LIMIT", "8")
+	t.Setenv("PATH", "/usr/bin")
+	ocrThreads = 0
+	env := strings.Join(engineEnv("/job"), "\n")
+	for _, line := range []string{"TESSDATA_PREFIX=/tess", "OMP_THREAD_LIMIT=8", "PATH=/usr/bin", "TMPDIR=/job"} {
+		if !strings.Contains(env, line) {
+			t.Fatalf("missing %s in %s", line, env)
+		}
+	}
+	ocrThreads = 2
+	env = strings.Join(engineEnv(""), "\n")
+	if !strings.Contains(env, "OMP_THREAD_LIMIT=2") || strings.Contains(env, "OMP_THREAD_LIMIT=8") || strings.Contains(env, "TMPDIR=") {
+		t.Fatalf("threads env %s", env)
+	}
+}
+
+func TestTesseractArgsPutConfigLast(t *testing.T) {
+	args := ocrTesseractArgs("/in.png", "/out", []string{"-l", "eng"}, "alto")
+	want := []string{"/in.png", "/out", "--psm", "3", "--oem", "1", "-l", "eng", "alto"}
+	if strings.Join(args, " ") != strings.Join(want, " ") {
+		t.Fatalf("args %q", args)
+	}
+	txt := ocrTesseractArgs("/in.png", "/out", []string{"-l", "eng"}, "")
+	if txt[len(txt)-1] == "hocr" || txt[len(txt)-1] == "alto" {
+		t.Fatalf("txt args %q", txt)
+	}
+	if ocrTesseractOutputExt("alto") != ".xml" || ocrTesseractOutputExt("hocr") != ".hocr" || ocrTesseractOutputExt("txt") != ".txt" {
+		t.Fatal("extensions")
+	}
+}
+
+func TestConvertRejectsOptionsBeforeExec(t *testing.T) {
+	called := false
+	c := OCRConverter{run: func(context.Context, string, ...string) ([]byte, error) {
+		called = true
+		return nil, nil
+	}}
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.png")
+	out := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(in, pngIHDR(8, 8), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, opts := range []map[string]any{{"language": "eng"}, {"language": "rus"}, {"language": "eng+rus"}, {"other": 1}} {
+		if err := c.Convert(context.Background(), in, out, opts); err == nil || !strings.Contains(err.Error(), "options") {
+			t.Fatalf("opts %v err %v", opts, err)
+		}
+	}
+	pdf := filepath.Join(dir, "in.pdf")
+	if err := os.WriteFile(pdf, []byte("%PDF"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Convert(context.Background(), pdf, filepath.Join(dir, "out.hocr"), map[string]any{"language": ""}); err == nil {
+		t.Fatal("empty language key")
+	}
+	if called {
+		t.Fatal("a program ran")
+	}
+}
+
+func TestImageRejectsPixelsBeforeTesseract(t *testing.T) {
+	c := OCRConverter{MaxImagePixels: 100, run: func(context.Context, string, ...string) ([]byte, error) {
+		t.Fatal("tesseract")
+		return nil, nil
+	}}
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.png")
+	out := filepath.Join(dir, "out.txt")
+	if err := os.WriteFile(in, pngIHDR(101, 1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := c.Convert(context.Background(), in, out, nil)
+	if !errors.Is(err, ErrOCRImageTooLarge) {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(in, []byte("not an image"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = c.Convert(context.Background(), in, out, nil)
+	if !errors.Is(err, ErrDimensionsUnknown) {
+		t.Fatal(err)
+	}
+}
+
+func TestImageAcceptsEmptyOutputAndRenamesALTO(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.png")
+	out := filepath.Join(dir, "out.alto")
+	if err := os.WriteFile(in, pngIHDR(2, 2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := OCRConverter{MaxImagePixels: 100_000_000, run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+		if name != "tesseract" {
+			t.Fatalf("program %s", name)
+		}
+		want := in + " " + strings.TrimSuffix(out, ".alto") + " --psm 3 --oem 1 -l eng alto"
+		if strings.Join(args, " ") != want {
+			t.Fatalf("args %q", args)
+		}
+		if err := os.WriteFile(args[1]+".xml", nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return nil, nil
+	}}
+	if err := c.Convert(context.Background(), in, out, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(out)
+	if err != nil || info.Size() != 0 || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("output %v %v", info, err)
+	}
+	missing := OCRConverter{MaxImagePixels: 100_000_000, run: func(context.Context, string, ...string) ([]byte, error) {
+		return nil, nil
+	}}
+	txt := filepath.Join(dir, "out.txt")
+	if err := missing.Convert(context.Background(), in, txt, nil); err == nil {
+		t.Fatal("missing output")
+	}
+}
+
+func TestPDFTextLayerSkipsTesseract(t *testing.T) {
+	text := strings.Repeat("a", 17)
+	var names []string
+	c := pdfConverter(t, &names, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			return []byte("Pages: 4\n"), nil
+		case "pdftotext":
+			if len(args) != 2 || args[1] != "-" {
+				t.Fatalf("pdftotext %q", args)
+			}
+			return []byte(text), nil
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil || string(body) != text {
+		t.Fatalf("body %q %v", body, err)
+	}
+	if strings.Join(names, ",") != "pdfinfo,pdftotext" {
+		t.Fatalf("calls %v", names)
+	}
+}
+
+func TestShortTextLayerIsOCRed(t *testing.T) {
+	if hasUsableTextLayer(16) || !hasUsableTextLayer(17) {
+		t.Fatal("threshold")
+	}
+	var names []string
+	c := pdfConverter(t, &names, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			if containsArg(args, "-f", "1") {
+				return []byte("Page    1 size:  612 x 792 pts\n"), nil
+			}
+			return []byte("Pages: 1\n"), nil
+		case "pdftotext":
+			return []byte(strings.Repeat("a", 16)), nil
+		case "pdftoppm":
+			assertSinglePage(t, args, 1)
+			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
+		case "tesseract":
+			return nil, os.WriteFile(args[1]+".txt", []byte("scan"), 0o644)
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil || string(body) != "scan" {
+		t.Fatalf("body %q %v", body, err)
+	}
+	if strings.Join(names, ",") != "pdfinfo,pdftotext,pdfinfo,pdftoppm,tesseract" {
+		t.Fatalf("calls %v", names)
+	}
+}
+
+func TestHOCRSkipsTextExtractionAndMergesPages(t *testing.T) {
+	var names []string
+	page := 0
+	c := pdfConverter(t, &names, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			if containsArg(args, "-f", "1") || containsArg(args, "-f", "2") {
+				return []byte("Page    " + argAfter(args, "-f") + " size:  612 x 792 pts\n"), nil
+			}
+			return []byte("Pages: 2\n"), nil
+		case "pdftotext":
+			t.Fatal("pdftotext")
+			return nil, nil
+		case "pdftoppm":
+			page++
+			assertSinglePage(t, args, page)
+			if !strings.Contains(args[len(args)-1], ".ocr-pdf-") {
+				t.Fatalf("workdir %q", args[len(args)-1])
+			}
+			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
+		case "tesseract":
+			if args[len(args)-1] != "hocr" || !strings.Contains(strings.Join(args, " "), "--psm 3 --oem 1 -l eng hocr") {
+				t.Fatalf("args %q", args)
+			}
+			word := "Hello &amp; co"
+			if page == 2 {
+				word = "World"
+			}
+			return nil, os.WriteFile(args[1]+".hocr", hocrFragment(word), 0o644)
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.hocr")
+	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(body), "<?xml") != 1 || strings.Count(string(body), "<html") != 1 {
+		t.Fatalf("not one document:\n%s", body)
+	}
+	if !strings.Contains(string(body), `id="page_1"`) || !strings.Contains(string(body), `id="page_2"`) {
+		t.Fatalf("ids:\n%s", body)
+	}
+	if !strings.Contains(string(body), "Hello &amp; co") || strings.Contains(string(body), "&amp;amp;") {
+		t.Fatalf("escape:\n%s", body)
+	}
+	if strings.Contains(strings.Join(names, ","), "pdftotext") {
+		t.Fatalf("calls %v", names)
+	}
+}
+
+func TestPDFALTOReadsTesseractXML(t *testing.T) {
+	c := pdfConverter(t, nil, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			if containsArg(args, "-f", "1") {
+				return []byte("Page    1 size:  612 x 792 pts\n"), nil
+			}
+			return []byte("Pages: 1\n"), nil
+		case "pdftoppm":
+			assertSinglePage(t, args, 1)
+			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
+		case "tesseract":
+			if args[len(args)-1] != "alto" {
+				t.Fatalf("args %q", args)
+			}
+			if err := os.WriteFile(args[1]+".alto", []byte("wrong"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return nil, os.WriteFile(args[1]+".xml", altoFragment("Hi"), 0o644)
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.alto")
+	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(body), "<?xml") != 1 || strings.Count(string(body), "<alto") != 1 || !strings.Contains(string(body), `ID="page_1"`) || !strings.Contains(string(body), "Hi") {
+		t.Fatalf("alto:\n%s", body)
+	}
+}
+
+func TestPageCapAndPageBoxFailBeforeRender(t *testing.T) {
+	capped := pdfConverter(t, nil, func(name string, args []string) ([]byte, error) {
+		if name != "pdfinfo" {
+			t.Fatalf("program %s", name)
+		}
+		return []byte("Pages: 201\n"), nil
+	})
+	capped.MaxPages = 200
+	dir := t.TempDir()
+	err := capped.Convert(context.Background(), filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.txt"), nil)
+	if !errors.Is(err, ErrOCRTooManyPages) {
+		t.Fatal(err)
+	}
+	boxed := pdfConverter(t, nil, func(name string, args []string) ([]byte, error) {
+		if name == "pdftoppm" || name == "tesseract" || name == "pdftotext" {
+			t.Fatalf("program %s", name)
+		}
+		if containsArg(args, "-f", "1") {
+			return []byte("Page    1 size:  3000 x 3000 pts\n"), nil
+		}
+		return []byte("Pages: 1\n"), nil
+	})
+	boxed.MaxPages = 200
+	boxed.MaxImagePixels = 100_000_000
+	err = boxed.Convert(context.Background(), filepath.Join(dir, "in.pdf"), filepath.Join(dir, "out.hocr"), nil)
+	if !errors.Is(err, ErrOCRPageBoxTooLarge) {
+		t.Fatal(err)
+	}
+	open := pdfConverter(t, nil, func(name string, _ []string) ([]byte, error) {
+		if name != "pdfinfo" && name != "pdftotext" {
+			t.Fatalf("program %s", name)
+		}
+		if name == "pdftotext" {
+			return []byte(strings.Repeat("a", 17)), nil
+		}
+		return []byte("Pages: 500\n"), nil
+	})
+	open.MaxPages = 0
+	out := filepath.Join(dir, "open.txt")
+	if err := open.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGoSourcesDoNotNameLandlock(t *testing.T) {
+	root := filepath.Join("..", "..")
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if bytes.Contains(bytes.ToLower(body), []byte("landlock")) {
+			t.Fatalf("%s names landlock", path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeclaredDimensions(t *testing.T) {
+	w, h, ok := pngDimensions(pngIHDR(100, 40))
+	if !ok || w != 100 || h != 40 {
+		t.Fatalf("png %d %d %v", w, h, ok)
+	}
+	if _, _, ok = pngDimensions([]byte("short")); ok {
+		t.Fatal("short png")
+	}
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x02, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x02, 0x00, 0x03}
+	w, h, ok = jpegDimensions(jpeg)
+	if !ok || w != 3 || h != 2 {
+		t.Fatalf("jpeg %d %d %v", w, h, ok)
+	}
+	webp := make([]byte, 30)
+	copy(webp[0:4], []byte("RIFF"))
+	copy(webp[8:12], []byte("WEBP"))
+	copy(webp[12:16], []byte("VP8X"))
+	webp[24], webp[27] = 9, 19
+	w, h, ok = webpDimensions(webp)
+	if !ok || w != 10 || h != 20 {
+		t.Fatalf("webp %d %d %v", w, h, ok)
+	}
+	tiff := []byte{
+		'I', 'I', 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,
+		0x02, 0x00,
+		0x00, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00,
+		0x01, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x00, 0x00,
+	}
+	w, h, ok = tiffDimensions(tiff)
+	if !ok || w != 10 || h != 20 {
+		t.Fatalf("tiff %d %d %v", w, h, ok)
+	}
+	if HasDimensionLimit("heic") || HasDimensionLimit("pdf") {
+		t.Fatal("unexpected parser")
+	}
+}
+
+func pdfConverter(t *testing.T, names *[]string, fn func(name string, args []string) ([]byte, error)) OCRConverter {
+	t.Helper()
+	return OCRConverter{
+		MaxPages:       200,
+		MaxImagePixels: 100_000_000,
+		run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if names != nil {
+				*names = append(*names, name)
+			}
+			return fn(name, append([]string(nil), args...))
+		},
+	}
+}
+
+func assertSinglePage(t *testing.T, args []string, page int) {
+	t.Helper()
+	pageStr := strconv.Itoa(page)
+	if !containsArg(args, "-r", "300") || !containsArg(args, "-f", pageStr) || !containsArg(args, "-l", pageStr) || !hasArg(args, "-singlefile") || !hasArg(args, "-png") {
+		t.Fatalf("pdftoppm %q", args)
+	}
+}
+
+func containsArg(args []string, key, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == key && args[i+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func hasArg(args []string, key string) bool {
+	for _, arg := range args {
+		if arg == key {
+			return true
+		}
+	}
+	return false
+}
+
+func argAfter(args []string, key string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == key {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func pngIHDR(w, h uint32) []byte {
+	b := make([]byte, 24)
+	copy(b, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'})
+	binary.BigEndian.PutUint32(b[8:12], 13)
+	copy(b[12:16], []byte("IHDR"))
+	binary.BigEndian.PutUint32(b[16:20], w)
+	binary.BigEndian.PutUint32(b[20:24], h)
+	return b
+}
+
+func hocrFragment(word string) []byte {
+	return []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<div class="ocr_page" id="page_1"><span class="ocrx_word">` + word + `</span></div>
+</body></html>`)
+}
+
+func altoFragment(word string) []byte {
+	return []byte(`<?xml version="1.0" encoding="UTF-8"?>
+<alto xmlns="http://www.loc.gov/standards/alto/ns-v3#"><Layout>
+<Page ID="page_1"><PrintSpace><String CONTENT="` + word + `"/></PrintSpace></Page>
+</Layout></alto>`)
+}
