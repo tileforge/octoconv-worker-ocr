@@ -12,11 +12,13 @@ import (
 	"strings"
 )
 
+// pdfinfo reports the CropBox. pdftoppm renders the MediaBox unless -cropbox is set.
 func ocrRasterizePageArgs(pdfPath, outBase string, page, dpi int) []string {
 	return []string{
 		"-r", strconv.Itoa(dpi),
 		"-f", strconv.Itoa(page),
 		"-l", strconv.Itoa(page),
+		"-cropbox",
 		"-singlefile",
 		"-png",
 		pdfPath, outBase,

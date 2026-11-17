@@ -932,7 +932,7 @@ func pdfConverter(t *testing.T, names *[]string, fn func(name string, args []str
 func assertSinglePage(t *testing.T, args []string, page int) {
 	t.Helper()
 	pageStr := strconv.Itoa(page)
-	if !containsArg(args, "-r", "300") || !containsArg(args, "-f", pageStr) || !containsArg(args, "-l", pageStr) || !hasArg(args, "-singlefile") || !hasArg(args, "-png") {
+	if !containsArg(args, "-r", "300") || !containsArg(args, "-f", pageStr) || !containsArg(args, "-l", pageStr) || !hasArg(args, "-cropbox") || !hasArg(args, "-singlefile") || !hasArg(args, "-png") {
 		t.Fatalf("pdftoppm %q", args)
 	}
 }
