@@ -3,9 +3,13 @@ package convert
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 )
+
+// ErrOutputTooLarge means the result exceeds the class output ceiling.
+var ErrOutputTooLarge = errors.New("output too large")
 
 const (
 	EngineOCR                   = "ocr"

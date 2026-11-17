@@ -409,6 +409,118 @@ func TestPageCapAndPageBoxFailBeforeRender(t *testing.T) {
 	}
 }
 
+func TestPdftotextKeepsTheStartAndRejectsPastTheCeiling(t *testing.T) {
+	dir := t.TempDir()
+	payload := append([]byte("HEAD"), bytes.Repeat([]byte("a"), 1<<20)...)
+	payload = append(payload, []byte("TAIL")...)
+	data := filepath.Join(dir, "layer.txt")
+	if err := os.WriteFile(data, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "pdftotext")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\n/bin/cat \""+data+"\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	c := OCRConverter{}
+	out, err := c.exec(context.Background(), dir, "pdftotext", "in.pdf", "-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(out, []byte("HEAD")) || !bytes.HasSuffix(out, []byte("TAIL")) || len(out) != len(payload) {
+		t.Fatalf("len %d prefix %q suffix %q", len(out), out[:4], out[len(out)-4:])
+	}
+	c.maxOutput = 8
+	if _, err := c.exec(context.Background(), dir, "pdftotext", "in.pdf", "-"); !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatal(err)
+	}
+}
+
+func TestTextLayerOverTheCeilingIsRejected(t *testing.T) {
+	c := pdfConverter(t, nil, func(name string, _ []string) ([]byte, error) {
+		if name == "pdftotext" {
+			return []byte(strings.Repeat("a", 17)), nil
+		}
+		return []byte("Pages: 1\n"), nil
+	})
+	c.maxOutput = 4
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil)
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Lstat(out); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal(statErr)
+	}
+}
+
+func TestPageAccumulationStopsAtTheCeiling(t *testing.T) {
+	var calls int
+	c := pdfConverter(t, nil, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			if containsArg(args, "-f", "1") || containsArg(args, "-f", "2") {
+				return []byte("Page    " + argAfter(args, "-f") + " size:  612 x 792 pts\n"), nil
+			}
+			return []byte("Pages: 2\n"), nil
+		case "pdftotext":
+			return []byte("short"), nil
+		case "pdftoppm":
+			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
+		case "tesseract":
+			calls++
+			return nil, os.WriteFile(args[1]+".txt", []byte("123456"), 0o644)
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	c.maxOutput = 10
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil)
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("tesseract calls %d", calls)
+	}
+	if _, statErr := os.Lstat(out); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal(statErr)
+	}
+}
+
+func TestMergedDocumentOverTheCeilingIsNotWritten(t *testing.T) {
+	fragment := hocrFragment("Hi")
+	c := pdfConverter(t, nil, func(name string, args []string) ([]byte, error) {
+		switch name {
+		case "pdfinfo":
+			if containsArg(args, "-f", "1") {
+				return []byte("Page    1 size:  612 x 792 pts\n"), nil
+			}
+			return []byte("Pages: 1\n"), nil
+		case "pdftoppm":
+			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
+		case "tesseract":
+			return nil, os.WriteFile(args[1]+".hocr", fragment, 0o644)
+		default:
+			t.Fatalf("program %s", name)
+			return nil, nil
+		}
+	})
+	c.maxOutput = len(fragment)
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.hocr")
+	err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil)
+	if !errors.Is(err, ErrOutputTooLarge) {
+		t.Fatal(err)
+	}
+	if _, statErr := os.Lstat(out); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatal(statErr)
+	}
+}
+
 func TestGoSourcesDoNotNameLandlock(t *testing.T) {
 	root := filepath.Join("..", "..")
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {

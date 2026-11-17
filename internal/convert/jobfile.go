@@ -51,6 +51,25 @@ func OpenJobFile(path string) (*os.File, fs.FileInfo, error) {
 	return f, info, nil
 }
 
+func readCapped(path string, max int) ([]byte, error) {
+	if max < 0 {
+		return nil, ErrOutputTooLarge
+	}
+	f, info, err := OpenJobFile(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	if info.Size() > int64(max) {
+		return nil, ErrOutputTooLarge
+	}
+	buf := make([]byte, info.Size())
+	if _, err := io.ReadFull(f, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
 func ReadJobFile(path string) ([]byte, error) {
 	f, _, err := OpenJobFile(path)
 	if err != nil {

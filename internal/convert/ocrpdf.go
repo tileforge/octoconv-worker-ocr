@@ -59,7 +59,7 @@ func ocrPageWorkDir(outPath string) (string, error) {
 	return dir, nil
 }
 
-func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir string, page int, configfile, targetFormat string) ([]byte, error) {
+func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir string, page, remain int, configfile, targetFormat string) ([]byte, error) {
 	sizeOut, err := c.exec(ctx, jobDir, "pdfinfo", ocrPDFPageSizeArgs(pdfPath, page)...)
 	if err != nil {
 		return nil, fmt.Errorf("ocr: pdfinfo: %w", err)
@@ -83,9 +83,9 @@ func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir st
 	}
 	produced := pageOutBase + ocrTesseractOutputExt(targetFormat)
 	defer os.Remove(produced)
-	fragment, err := ReadJobFile(produced)
+	fragment, err := readCapped(produced, remain)
 	if err != nil {
-		return nil, fmt.Errorf("ocr: read page output: %w", err)
+		return nil, err
 	}
 	return fragment, nil
 }
@@ -97,6 +97,9 @@ func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFor
 		return err
 	}
 	if guard.done {
+		if len(guard.text) > c.outputLimit() {
+			return ErrOutputTooLarge
+		}
 		if err := writeNewFile(outPath, guard.text, 0o644); err != nil {
 			return fmt.Errorf("ocr: write output: %w", err)
 		}
@@ -113,11 +116,21 @@ func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFor
 		merger = newOCRPageMerger(targetFormat)
 	}
 	var textBuf bytes.Buffer
+	retained := 0
+	limit := c.outputLimit()
 	for page := 1; page <= guard.totalPages; page++ {
-		fragment, err := c.ocrPDFPage(ctx, jobDir, inPath, tmpDir, page, configfile, targetFormat)
+		remain := limit - retained
+		if remain < 0 {
+			return ErrOutputTooLarge
+		}
+		fragment, err := c.ocrPDFPage(ctx, jobDir, inPath, tmpDir, page, remain, configfile, targetFormat)
 		if err != nil {
 			return err
 		}
+		if len(fragment) > remain {
+			return ErrOutputTooLarge
+		}
+		retained += len(fragment)
 		if merger != nil {
 			if err := merger.AddPage(page, fragment); err != nil {
 				return fmt.Errorf("ocr: %w", err)
@@ -131,6 +144,9 @@ func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFor
 		finalBytes, err = merger.Finalize()
 		if err != nil {
 			return fmt.Errorf("ocr: %w", err)
+		}
+		if len(finalBytes) > limit {
+			return ErrOutputTooLarge
 		}
 	}
 	if err := writeNewFile(outPath, finalBytes, 0o644); err != nil {

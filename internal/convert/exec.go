@@ -64,6 +64,61 @@ func (t *tailBuffer) String() string {
 	return fmt.Sprintf("[octoconv: %d earlier bytes of engine output discarded]\n%s", t.dropped, t.buf)
 }
 
+// capBuffer keeps the leading bytes. Past max it discards the rest and records overflow.
+// pdftotext writes the text layer to stdout, so a tail would drop the start of the document.
+type capBuffer struct {
+	max      int
+	buf      []byte
+	overflow bool
+}
+
+func (b *capBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	if b.overflow {
+		return n, nil
+	}
+	if b.max >= 0 && len(b.buf)+n > b.max {
+		b.overflow = true
+		b.buf = nil
+		return n, nil
+	}
+	b.buf = append(b.buf, p...)
+	return n, nil
+}
+
+func runCapture(ctx context.Context, env []string, limit int, name string, args ...string) ([]byte, error) {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = engineWaitDelay
+	if env != nil {
+		cmd.Env = env
+	}
+	stdout := &capBuffer{max: limit}
+	stderr := &tailBuffer{max: engineOutputLimit}
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start %s: %w", name, err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-ctx.Done():
+		killGroup(cmd.Process.Pid, done)
+		return nil, fmt.Errorf("%s killed: %w", name, ctx.Err())
+	case err := <-done:
+		if stdout.overflow {
+			killGroup(cmd.Process.Pid, nil)
+			return nil, ErrOutputTooLarge
+		}
+		if err != nil {
+			killGroup(cmd.Process.Pid, nil)
+			return nil, fmt.Errorf("%s failed: %w: %s", name, err, stderr.String())
+		}
+		return append([]byte(nil), stdout.buf...), nil
+	}
+}
+
 func runCommand(ctx context.Context, env []string, name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

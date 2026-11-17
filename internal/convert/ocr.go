@@ -34,7 +34,15 @@ func init() {
 type OCRConverter struct {
 	MaxImagePixels uint64
 	MaxPages       int
+	maxOutput      int
 	run            func(ctx context.Context, name string, args ...string) ([]byte, error)
+}
+
+func (c OCRConverter) outputLimit() int {
+	if c.maxOutput > 0 {
+		return c.maxOutput
+	}
+	return int(MaxFileBytes)
 }
 
 // SetOCRThreads stores the OMP_THREAD_LIMIT passed to tesseract.
@@ -117,7 +125,11 @@ func (c OCRConverter) exec(ctx context.Context, jobDir, name string, args ...str
 	if c.run != nil {
 		return c.run(ctx, name, args...)
 	}
-	return runCommand(ctx, engineEnv(jobDir), name, args...)
+	env := engineEnv(jobDir)
+	if name == "pdftotext" {
+		return runCapture(ctx, env, c.outputLimit(), name, args...)
+	}
+	return runCommand(ctx, env, name, args...)
 }
 
 // Convert rejects any options map before pdfinfo or tesseract. An empty map uses -l eng.

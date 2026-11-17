@@ -45,7 +45,6 @@ var (
 	errOriginRejected   = errors.New("origin_rejected")
 	errSessionClosed    = errors.New("session_closed")
 	errAttemptNotActive = errors.New("attempt_not_active")
-	errOutputTooLarge   = errors.New("output too large")
 )
 
 func ocrEngineCode(err error) string {
@@ -721,7 +720,7 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 		if errors.Is(err, errOriginRejected) {
 			return errOriginRejected
 		}
-		if errors.Is(err, errOutputTooLarge) {
+		if errors.Is(err, convert.ErrOutputTooLarge) {
 			return c.fail(ctx, asgn, "engine_error", "output too large")
 		}
 		return c.fail(ctx, asgn, ocrEngineCode(err), safeMessage(err))
@@ -839,7 +838,7 @@ func readLimitedJobFile(path string, maxOut int64) ([]byte, error) {
 		return nil, err
 	}
 	if int64(len(payload)) > limit {
-		return nil, errOutputTooLarge
+		return nil, convert.ErrOutputTooLarge
 	}
 	return payload, nil
 }
