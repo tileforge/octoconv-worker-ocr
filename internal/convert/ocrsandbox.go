@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,6 +30,8 @@ const (
 	ocrPreflightOutsideBase = "/var/tmp"
 	ocrPreflightText        = "OCTOCONV SANDBOX PREFLIGHT"
 	ocrPreflightWord        = "OCTOCONV"
+	ocrPreflightPageWidth   = 1000
+	ocrPreflightPageHeight  = 200
 )
 
 func (c OCRConverter) WithSandbox(helper []string) OCRConverter {
@@ -52,6 +55,7 @@ func OCRPreflight(ctx context.Context, c OCRConverter) (OCRProof, error) {
 	if !c.sandbox.confines() {
 		return OCRProof{}, nil
 	}
+	c = c.forPreflight()
 	w, cleanup, err := newPreflightWorkspaceOutside("ocr", ocrPreflightOutsideBase)
 	if err != nil {
 		return OCRProof{}, err
@@ -108,8 +112,28 @@ func OCRPreflight(ctx context.Context, c OCRConverter) (OCRProof, error) {
 	return OCRProof{LayerBytes: len(layer)}, nil
 }
 
+// pdftoppm ceils pts*dpi/72. enforcePageBoxBound rounds the same product.
+func (c OCRConverter) forPreflight() OCRConverter {
+	need := ocrPreflightPixels()
+	if c.MaxImagePixels == 0 || c.MaxImagePixels < need {
+		c.MaxImagePixels = need
+	}
+	return c
+}
+
+func ocrPreflightPixels() uint64 {
+	w := float64(ocrPreflightPageWidth) / 72 * float64(ocrRasterizeDPI)
+	h := float64(ocrPreflightPageHeight) / 72 * float64(ocrRasterizeDPI)
+	rounded := uint64(math.Round(w)) * uint64(math.Round(h))
+	ceiled := uint64(math.Ceil(w)) * uint64(math.Ceil(h))
+	if ceiled > rounded {
+		return ceiled
+	}
+	return rounded
+}
+
 func ocrPreflightPDF(text string) []byte {
-	const width, height = 1000, 200
+	const width, height = ocrPreflightPageWidth, ocrPreflightPageHeight
 	content := []byte(fmt.Sprintf("BT\n/F1 40 Tf\n20 100 Td\n(%s) Tj\nET\n", text))
 	contentObj := append(
 		[]byte(fmt.Sprintf("<< /Length %d >>\nstream\n", len(content))),

@@ -1,7 +1,9 @@
 package convert
 
 import (
+	"context"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,6 +74,46 @@ func TestForJobGrantsTheJobDirectoryAndEngines(t *testing.T) {
 	var bare OCRConverter
 	if got := bare.jobExec(job).spec; len(got) != 0 {
 		t.Fatalf("unconfined spec %q", got)
+	}
+}
+
+func TestPreflightCopyAcceptsTheFixtureWithoutChangingTheJobCap(t *testing.T) {
+	const low uint64 = 1_000_000
+	stub := func(_ context.Context, name string, _ ...string) ([]byte, error) {
+		if name == "pdfinfo" {
+			return []byte("Pages: 1\nPage 1 size: 1000 x 200 pts\n"), nil
+		}
+		return nil, errors.New("stop at " + name)
+	}
+	c := OCRConverter{MaxPages: 1, MaxImagePixels: low, run: stub}
+	err := c.Convert(t.Context(), "in.pdf", filepath.Join(t.TempDir(), "out.hocr"), nil)
+	if !errors.Is(err, ErrOCRPageBoxTooLarge) {
+		t.Fatalf("low cap: %v", err)
+	}
+	raised := c.forPreflight()
+	if c.MaxImagePixels != low {
+		t.Fatalf("job cap changed to %d", c.MaxImagePixels)
+	}
+	err = raised.Convert(t.Context(), "in.pdf", filepath.Join(t.TempDir(), "out.hocr"), nil)
+	if errors.Is(err, ErrOCRPageBoxTooLarge) || !strings.Contains(err.Error(), "pdftoppm") {
+		t.Fatalf("raised cap: %v", err)
+	}
+	if err := enforcePageBoxBound(ocrPreflightPageWidth, ocrPreflightPageHeight, ocrRasterizeDPI, raised.MaxImagePixels); err != nil {
+		t.Fatal(err)
+	}
+	w := uint64(math.Ceil(float64(ocrPreflightPageWidth) / 72 * float64(ocrRasterizeDPI)))
+	h := uint64(math.Ceil(float64(ocrPreflightPageHeight) / 72 * float64(ocrRasterizeDPI)))
+	if raised.MaxImagePixels < w*h {
+		t.Fatalf("cap %d is below the ceiled raster %d", raised.MaxImagePixels, w*h)
+	}
+
+	high := OCRConverter{MaxPages: DefaultMaxPages, MaxImagePixels: uint64(DefaultMaxImagePixels)}
+	if got := high.forPreflight(); got.MaxImagePixels != high.MaxImagePixels || got.MaxPages != high.MaxPages {
+		t.Fatalf("default cap changed: %+v", got)
+	}
+	open := OCRConverter{}
+	if got := open.forPreflight(); got.MaxImagePixels != ocrPreflightPixels() || open.MaxImagePixels != 0 {
+		t.Fatalf("open cap copy %d original %d", got.MaxImagePixels, open.MaxImagePixels)
 	}
 }
 
