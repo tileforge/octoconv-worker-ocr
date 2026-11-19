@@ -61,7 +61,7 @@ func ocrPageWorkDir(outPath string) (string, error) {
 	return dir, nil
 }
 
-func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir string, page, remain int, configfile, targetFormat string) ([]byte, error) {
+func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir string, page, remain int, configfile, targetFormat string, langArgs []string) ([]byte, error) {
 	sizeOut, err := c.exec(ctx, jobDir, "pdfinfo", ocrPDFPageSizeArgs(pdfPath, page)...)
 	if err != nil {
 		return nil, fmt.Errorf("ocr: pdfinfo: %w", err)
@@ -79,7 +79,7 @@ func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir st
 	}
 	defer os.Remove(pageImageBase + ".png")
 	pageOutBase := filepath.Join(tmpDir, "pageout")
-	args := ocrTesseractArgs(pageImageBase+".png", pageOutBase, []string{"-l", ocrDefaultLanguage}, configfile)
+	args := ocrTesseractArgs(pageImageBase+".png", pageOutBase, langArgs, configfile)
 	if _, err := c.exec(ctx, jobDir, "tesseract", args...); err != nil {
 		return nil, fmt.Errorf("ocr: tesseract: %w", err)
 	}
@@ -92,7 +92,7 @@ func (c OCRConverter) ocrPDFPage(ctx context.Context, jobDir, pdfPath, tmpDir st
 	return fragment, nil
 }
 
-func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFormat, configfile string) error {
+func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFormat, configfile string, langArgs []string) error {
 	jobDir := filepath.Dir(outPath)
 	guard, err := c.ocrPDFGuardStage(ctx, jobDir, inPath)
 	if err != nil {
@@ -137,7 +137,7 @@ func (c OCRConverter) convertPDF(ctx context.Context, inPath, outPath, targetFor
 				return err
 			}
 		}
-		fragment, err := c.ocrPDFPage(ctx, jobDir, inPath, tmpDir, page, remain, configfile, targetFormat)
+		fragment, err := c.ocrPDFPage(ctx, jobDir, inPath, tmpDir, page, remain, configfile, targetFormat, langArgs)
 		if err != nil {
 			return err
 		}

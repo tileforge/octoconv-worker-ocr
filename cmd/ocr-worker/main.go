@@ -1,4 +1,4 @@
-// Command ocr-worker runs one approved ocr capability over Worker Protocol v1.
+// Command ocr-worker runs one approved ocr capability over Worker Protocol v2.
 package main
 
 import (

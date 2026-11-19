@@ -20,6 +20,16 @@ func TestPairsMatchManifest(t *testing.T) {
 	}
 	var doc struct {
 		Capabilities []struct {
+			ParameterSchema struct {
+				Type                 string `json:"type"`
+				AdditionalProperties bool   `json:"additionalProperties"`
+				Properties           struct {
+					Language struct {
+						Type    string `json:"type"`
+						Pattern string `json:"pattern"`
+					} `json:"language"`
+				} `json:"properties"`
+			} `json:"parameter_schema"`
 			Formats []Pair `json:"formats"`
 		} `json:"capabilities"`
 	}
@@ -29,6 +39,10 @@ func TestPairsMatchManifest(t *testing.T) {
 	got := (OCRConverter{}).Pairs()
 	if len(doc.Capabilities) != 1 || len(got) != 15 || len(doc.Capabilities[0].Formats) != len(got) {
 		t.Fatalf("pairs %d manifest %d", len(got), len(doc.Capabilities[0].Formats))
+	}
+	schema := doc.Capabilities[0].ParameterSchema
+	if schema.Type != "object" || schema.AdditionalProperties || schema.Properties.Language.Type != "string" || schema.Properties.Language.Pattern != `^(eng|rus)(\+(eng|rus))*$` {
+		t.Fatalf("schema %+v", schema)
 	}
 	for i, pair := range got {
 		want := doc.Capabilities[0].Formats[i]
@@ -112,6 +126,44 @@ func TestTesseractArgsPutConfigLast(t *testing.T) {
 	}
 }
 
+func TestConvertLanguageReachesTesseract(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.png")
+	if err := os.WriteFile(in, pngIHDR(8, 8), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		opts map[string]any
+		lang string
+	}{
+		{nil, "eng"},
+		{map[string]any{}, "eng"},
+		{map[string]any{"language": ""}, "eng"},
+		{map[string]any{"language": "eng"}, "eng"},
+		{map[string]any{"language": "rus"}, "rus"},
+		{map[string]any{"language": "eng+rus"}, "eng+rus"},
+		{map[string]any{"language": "rus+eng"}, "rus+eng"},
+		{map[string]any{"language": "eng+eng"}, "eng+eng"},
+	}
+	for _, tc := range cases {
+		var programs []string
+		c := OCRConverter{MaxImagePixels: 100_000_000, run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			programs = append(programs, name)
+			if name != "tesseract" || !containsArg(args, "-l", tc.lang) {
+				t.Fatalf("%v program %s args %q", tc.opts, name, args)
+			}
+			return nil, os.WriteFile(args[1]+".txt", []byte("x"), 0o644)
+		}}
+		out := filepath.Join(dir, "out.txt")
+		if err := c.Convert(context.Background(), in, out, tc.opts); err != nil {
+			t.Fatalf("%v %v", tc.opts, err)
+		}
+		if strings.Join(programs, ",") != "tesseract" {
+			t.Fatalf("%v programs %v", tc.opts, programs)
+		}
+	}
+}
+
 func TestConvertRejectsOptionsBeforeExec(t *testing.T) {
 	called := false
 	c := OCRConverter{run: func(context.Context, string, ...string) ([]byte, error) {
@@ -124,17 +176,31 @@ func TestConvertRejectsOptionsBeforeExec(t *testing.T) {
 	if err := os.WriteFile(in, pngIHDR(8, 8), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	for _, opts := range []map[string]any{{"language": "eng"}, {"language": "rus"}, {"language": "eng+rus"}, {"other": 1}} {
-		if err := c.Convert(context.Background(), in, out, opts); err == nil || !strings.Contains(err.Error(), "options") {
-			t.Fatalf("opts %v err %v", opts, err)
-		}
-	}
 	pdf := filepath.Join(dir, "in.pdf")
 	if err := os.WriteFile(pdf, []byte("%PDF"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Convert(context.Background(), pdf, filepath.Join(dir, "out.hocr"), map[string]any{"language": ""}); err == nil {
-		t.Fatal("empty language key")
+	bad := []map[string]any{
+		{"other": 1},
+		{"language": "chi_sim"},
+		{"language": "osd"},
+		{"language": "eng+chi_sim"},
+		{"language": "eng", "psm": 3},
+		{"language": 1},
+		{"language": 1.5},
+		{"language": true},
+		{"language": nil},
+		{"language": "ENG"},
+		{"language": "eng+"},
+		{"language": "+eng"},
+	}
+	for _, opts := range bad {
+		if err := c.Convert(context.Background(), in, out, opts); err == nil || !strings.Contains(err.Error(), "unsupported option") {
+			t.Fatalf("opts %v err %v", opts, err)
+		}
+		if err := c.Convert(context.Background(), pdf, filepath.Join(dir, "out.hocr"), opts); err == nil || !strings.Contains(err.Error(), "unsupported option") {
+			t.Fatalf("pdf opts %v err %v", opts, err)
+		}
 	}
 	if called {
 		t.Fatal("a program ran")
@@ -297,6 +363,9 @@ func TestShortTextLayerIsOCRed(t *testing.T) {
 			assertSinglePage(t, args, 1)
 			return nil, os.WriteFile(args[len(args)-1]+".png", []byte("x"), 0o644)
 		case "tesseract":
+			if !containsArg(args, "-l", "rus") {
+				t.Fatalf("args %q", args)
+			}
 			return nil, os.WriteFile(args[1]+".txt", []byte("scan"), 0o644)
 		default:
 			t.Fatalf("program %s", name)
@@ -305,7 +374,7 @@ func TestShortTextLayerIsOCRed(t *testing.T) {
 	})
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.txt")
-	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, nil); err != nil {
+	if err := c.Convert(context.Background(), filepath.Join(dir, "in.pdf"), out, map[string]any{"language": "rus"}); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(out)

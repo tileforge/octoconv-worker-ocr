@@ -512,7 +512,7 @@ func TestHeartbeatSessionClosedStopsTheAttempt(t *testing.T) {
 		case <-ctx.Done():
 			return
 		}
-		_ = c.postHeartbeat(ctx, []byte(`{"protocol_version":1}`))
+		_ = c.postHeartbeat(ctx, []byte(`{"protocol_version":2}`))
 	}()
 	err := c.runAssignment(ctx, asgn, controlJSON{})
 	if !errors.Is(err, errSessionClosed) {
@@ -596,7 +596,7 @@ func TestHeartbeatErrorLeavesTheAttemptRunning(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.postHeartbeat(context.Background(), []byte(`{"protocol_version":1}`)); err != nil {
+	if err := c.postHeartbeat(context.Background(), []byte(`{"protocol_version":2}`)); err != nil {
 		t.Fatal(err)
 	}
 	if c.sessionFailure() != nil || attempt.Err() != nil || flag.outcome() != "" {
@@ -612,6 +612,109 @@ func (fixedConverter) Pairs() []convert.Pair { return nil }
 
 func (f fixedConverter) Convert(_ context.Context, _, outPath string, _ map[string]any) error {
 	return os.WriteFile(outPath, f.body, 0o600)
+}
+
+type recordingConverter struct {
+	opts map[string]any
+}
+
+func (recordingConverter) Pairs() []convert.Pair { return nil }
+
+func (r *recordingConverter) Convert(_ context.Context, _, outPath string, opts map[string]any) error {
+	r.opts = opts
+	return os.WriteFile(outPath, []byte("text"), 0o600)
+}
+
+func TestAssignmentParameters(t *testing.T) {
+	for _, raw := range []string{"", "null", "{}", "  {}  "} {
+		opts, err := assignmentParameters(json.RawMessage(raw))
+		if err != nil || opts != nil {
+			t.Fatalf("%q -> %#v %v", raw, opts, err)
+		}
+	}
+	opts, err := assignmentParameters(json.RawMessage(`{"language":"eng+rus"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts["language"] != "eng+rus" {
+		t.Fatalf("%#v", opts)
+	}
+	if _, err := assignmentParameters(json.RawMessage(`[1]`)); err == nil {
+		t.Fatal("array accepted")
+	}
+	if _, err := assignmentParameters(json.RawMessage(`"eng"`)); err == nil {
+		t.Fatal("string accepted")
+	}
+}
+
+func TestOCRParametersReachTheConverter(t *testing.T) {
+	var mu sync.Mutex
+	var fails [][]byte
+	c := protocolTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte("source"))
+			return
+		}
+		if strings.Contains(r.URL.Path, "/fail") {
+			mu.Lock()
+			fails = append(fails, append([]byte(nil), body...))
+			mu.Unlock()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), nil)
+	c.fileHTTP = c.coreHTTP
+	c.operation = convert.OperationConvert
+	c.engineLimit = time.Minute
+	c.leaseSeconds = 30
+	c.sessionToken = "token"
+	rec := &recordingConverter{}
+	c.lookupOp = func(op, from, to string) (convert.Converter, bool) {
+		if op != convert.OperationConvert || from != "png" || to != "txt" {
+			return nil, false
+		}
+		return rec, true
+	}
+	href := c.core.String() + "/objects/png"
+	asgn := assignmentJSON{
+		AttemptID:       "png-txt",
+		AttemptToken:    "attempt-token",
+		AttemptDeadline: time.Now().Add(30 * time.Minute).Format(time.RFC3339Nano),
+		LeaseExpiresAt:  time.Now().Add(time.Hour).Format(time.RFC3339Nano),
+		Limits:          limitsJSON{MaxOutputBytes: convert.MaxFileBytes},
+		Inputs:          []fileLinkJSON{{Role: "source", Ordinal: 0, Href: href, Format: "png"}},
+		Outputs:         []fileLinkJSON{{Role: "primary", Ordinal: 0, Href: href, Format: "txt"}},
+		Parameters:      json.RawMessage(`{"language":"rus+eng"}`),
+	}
+	if err := c.runAssignment(context.Background(), asgn, controlJSON{}); err != nil {
+		t.Fatal(err)
+	}
+	if rec.opts["language"] != "rus+eng" {
+		t.Fatalf("%#v", rec.opts)
+	}
+
+	rec.opts = map[string]any{"called": true}
+	asgn.AttemptID = "bad-parameters"
+	asgn.Parameters = json.RawMessage(`[1]`)
+	if err := c.runAssignment(context.Background(), asgn, controlJSON{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, called := rec.opts["called"]; !called {
+		t.Fatal("bad parameters reached the converter")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fails) != 1 {
+		t.Fatalf("fail bodies %d", len(fails))
+	}
+	body := fails[0]
+	if !bytes.Contains(body, []byte(`"protocol_version":2`)) || !bytes.Contains(body, []byte(`"engine_code":"engine_error"`)) || !bytes.Contains(body, []byte(`"message":"assignment"`)) {
+		t.Fatalf("fail body %s", body)
+	}
 }
 
 func TestOCRPairsPostAnAcceptedComplete(t *testing.T) {
@@ -722,7 +825,7 @@ func acceptOCRComplete(raw []byte, puts map[string]putBody) error {
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return os.ErrInvalid
 	}
-	if body.ProtocolVersion != 1 || len(body.Artifacts) != 1 {
+	if body.ProtocolVersion != protocolVersion || len(body.Artifacts) != 1 {
 		return os.ErrInvalid
 	}
 	art := body.Artifacts[0]

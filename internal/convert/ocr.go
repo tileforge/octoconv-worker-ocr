@@ -30,7 +30,6 @@ func init() {
 }
 
 // OCRConverter shells out to tesseract, and to poppler for a PDF source.
-// A non-empty opts map is rejected. A nil or empty map means -l eng.
 type OCRConverter struct {
 	MaxImagePixels uint64
 	MaxPages       int
@@ -132,10 +131,15 @@ func (c OCRConverter) exec(ctx context.Context, jobDir, name string, args ...str
 	return runCommand(ctx, env, name, args...)
 }
 
-// Convert rejects any options map before pdfinfo or tesseract. An empty map uses -l eng.
+// Convert writes the OCR result for inPath to outPath.
 func (c OCRConverter) Convert(ctx context.Context, inPath, outPath string, opts map[string]any) error {
-	if len(opts) != 0 {
-		return errors.New("ocr: options are not accepted")
+	language, err := ocrLanguage(opts)
+	if err != nil {
+		return err
+	}
+	langArgs := ocrLanguageArgs(language)
+	if langArgs == nil {
+		langArgs = []string{"-l", ocrDefaultLanguage}
 	}
 	target := NormalizeFormat(filepath.Ext(outPath))
 	configfile, ok := ocrConfigFileFor(target)
@@ -144,7 +148,7 @@ func (c OCRConverter) Convert(ctx context.Context, inPath, outPath string, opts 
 	}
 	source := NormalizeFormat(filepath.Ext(inPath))
 	if source == "pdf" {
-		return c.convertPDF(ctx, inPath, outPath, target, configfile)
+		return c.convertPDF(ctx, inPath, outPath, target, configfile, langArgs)
 	}
 	switch source {
 	case "jpg", "png", "tiff", "webp":
@@ -155,7 +159,7 @@ func (c OCRConverter) Convert(ctx context.Context, inPath, outPath string, opts 
 		return err
 	}
 	outBase := strings.TrimSuffix(outPath, filepath.Ext(outPath))
-	args := ocrTesseractArgs(inPath, outBase, []string{"-l", ocrDefaultLanguage}, configfile)
+	args := ocrTesseractArgs(inPath, outBase, langArgs, configfile)
 	if _, err := c.exec(ctx, filepath.Dir(outPath), "tesseract", args...); err != nil {
 		return fmt.Errorf("ocr: tesseract: %w", err)
 	}
@@ -166,4 +170,34 @@ func (c OCRConverter) Convert(ctx context.Context, inPath, outPath string, opts 
 		}
 	}
 	return validateOCROutput(outPath)
+}
+
+func ocrLanguage(opts map[string]any) (string, error) {
+	if len(opts) == 0 {
+		return "", nil
+	}
+	raw, ok := opts["language"]
+	if !ok || len(opts) != 1 {
+		return "", errors.New("ocr: unsupported option")
+	}
+	language, ok := raw.(string)
+	if !ok {
+		return "", errors.New("ocr: unsupported option")
+	}
+	if language == "" {
+		return "", nil
+	}
+	for _, part := range strings.Split(language, "+") {
+		if part != "eng" && part != "rus" {
+			return "", errors.New("ocr: unsupported option")
+		}
+	}
+	return language, nil
+}
+
+func ocrLanguageArgs(language string) []string {
+	if language == "" {
+		return nil
+	}
+	return []string{"-l", language}
 }
