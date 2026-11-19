@@ -8,13 +8,20 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/tileforge/octoconv-worker-ocr/internal/convert"
+	"github.com/tileforge/octoconv-worker-ocr/internal/sandbox"
 )
 
+const ocrSandboxDisabledEnv = "OCR_SANDBOX_DISABLED"
+
 func main() {
+	if sandbox.RunExecModeIfRequested(os.Args) {
+		return
+	}
 	if err := refuseLegacyStores(); err != nil {
 		log.Fatalf("ocr protocol: %v", err)
 	}
@@ -24,6 +31,32 @@ func main() {
 	applyOCRLimits()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	sandboxHelper, err := sandbox.ResolveHelper(ocrSandboxDisabledEnv)
+	if err != nil {
+		log.Fatalf("ocr sandbox: %v", err)
+	}
+	conv := convert.Current().WithSandbox(sandboxHelper)
+	convert.Default.Register(conv)
+	if len(sandboxHelper) == 0 {
+		log.Printf("%s=true: the engine can read every file in this container", ocrSandboxDisabledEnv)
+	} else {
+		log.Printf("ocr sandbox: landlock via %s", strings.Join(sandboxHelper, " "))
+		if err := convert.StabilizeTempDir(); err != nil {
+			log.Fatalf("ocr sandbox: %v", err)
+		}
+	}
+
+	preflightCtx, cancelPreflight := context.WithTimeout(ctx, 60*time.Second)
+	proof, err := convert.OCRPreflight(preflightCtx, conv)
+	cancelPreflight()
+	if err != nil {
+		log.Fatalf("ocr sandbox preflight: %v", err)
+	}
+	if len(sandboxHelper) > 0 {
+		log.Printf("ocr sandbox proven: tesseract, pdfinfo, pdftoppm, and pdftotext ran inside the job directory and were denied a file outside every grant (text layer %d bytes, no outside output)", proof.LayerBytes)
+	}
+
 	dial, err := loadProtocolDial()
 	if err != nil {
 		log.Fatalf("ocr protocol: %v", err)
