@@ -34,6 +34,7 @@ type OCRConverter struct {
 	MaxImagePixels uint64
 	MaxPages       int
 	maxOutput      int
+	sandbox        *engineSandbox
 	run            func(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
@@ -125,10 +126,30 @@ func (c OCRConverter) exec(ctx context.Context, jobDir, name string, args ...str
 		return c.run(ctx, name, args...)
 	}
 	env := engineEnv(jobDir)
-	if name == "pdftotext" {
-		return runCapture(ctx, env, c.outputLimit(), name, args...)
+	cmdName, cmdArgs := name, args
+	var fault func(error) error
+	if c.sandbox.confines() {
+		ex := c.jobExec(jobDir)
+		var err error
+		cmdName, cmdArgs, err = ex.sandbox.wrapEngine(name, ex.spec, args)
+		if err != nil {
+			return nil, err
+		}
+		fault = ex.sandbox.sandboxFault
 	}
-	return runCommand(ctx, env, name, args...)
+	var (
+		out []byte
+		err error
+	)
+	if name == "pdftotext" {
+		out, err = runCapture(ctx, env, c.outputLimit(), cmdName, cmdArgs...)
+	} else {
+		out, err = runCommand(ctx, env, cmdName, cmdArgs...)
+	}
+	if fault != nil {
+		return out, fault(err)
+	}
+	return out, err
 }
 
 // Convert writes the OCR result for inPath to outPath.
