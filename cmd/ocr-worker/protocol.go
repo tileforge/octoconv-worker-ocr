@@ -95,10 +95,15 @@ func manifestOperation(manifest []byte) (string, error) {
 		return "", errors.New("ocr protocol manifest")
 	}
 	legacy := doc.Capabilities[0].Legacy
-	if legacy.Engine != convert.EngineOCR || legacy.Operation != convert.OperationConvert {
+	if legacy.Engine != convert.EngineOCR {
 		return "", errors.New("ocr protocol manifest")
 	}
-	return legacy.Operation, nil
+	switch legacy.Operation {
+	case convert.OperationConvert, convert.OperationRender:
+		return legacy.Operation, nil
+	default:
+		return "", errors.New("ocr protocol manifest")
+	}
 }
 
 func loadProtocolDial() (protocolDial, error) {
@@ -700,6 +705,9 @@ func (c *protocolClient) runAssignment(ctx context.Context, asgn assignmentJSON,
 	if err != nil {
 		return c.fail(ctx, asgn, "engine_error", "assignment")
 	}
+	if c.operation == convert.OperationRender && opts != nil {
+		return c.fail(ctx, asgn, "engine_error", "assignment")
+	}
 
 	bounded, cancelDeadline := context.WithDeadline(ctx, deadline)
 	attemptCtx, cancelAttempt := context.WithCancelCause(bounded)
@@ -862,7 +870,11 @@ func (c *protocolClient) convert(ctx context.Context, from, to string, src []byt
 	}
 	convertCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
-	if err := conv.Convert(convertCtx, inPath, outPath, opts); err != nil {
+	callOpts := opts
+	if c.operation == convert.OperationRender {
+		callOpts = nil
+	}
+	if err := conv.Convert(convertCtx, inPath, outPath, callOpts); err != nil {
 		return nil, err
 	}
 	return readLimitedJobFile(outPath, maxOut)
