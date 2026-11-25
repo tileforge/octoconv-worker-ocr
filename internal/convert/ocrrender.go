@@ -130,6 +130,29 @@ func ocrWholeEdge(raw any) (int, bool) {
 	}
 }
 
+func (c OCRRenderConverter) imagePixelLimit() uint64 {
+	if c.MaxImagePixels > 0 {
+		return c.MaxImagePixels
+	}
+	host := c.host()
+	if host.MaxImagePixels > 0 {
+		return host.MaxImagePixels
+	}
+	conv, ok := Default.LookupOp(OperationConvert, "jpg", "txt")
+	if !ok {
+		return 0
+	}
+	switch found := conv.(type) {
+	case *OCRConverter:
+		if found != nil {
+			return found.MaxImagePixels
+		}
+	case OCRConverter:
+		return found.MaxImagePixels
+	}
+	return 0
+}
+
 func (c OCRRenderConverter) host() OCRConverter {
 	if c.run != nil || c.sandbox != nil {
 		return c.OCRConverter
@@ -183,6 +206,9 @@ func (c OCRRenderConverter) renderPDF(ctx context.Context, inPath, outPath strin
 }
 
 func (c OCRRenderConverter) renderImage(ctx context.Context, from, inPath, outPath string, edge int) error {
+	if err := enforceImagePixelBound(inPath, c.imagePixelLimit()); err != nil {
+		return err
+	}
 	img, err := decodeRenderImage(from, inPath)
 	if err != nil {
 		return err

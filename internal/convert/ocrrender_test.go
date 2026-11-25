@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -685,6 +686,32 @@ func TestOCRRenderRasterFit(t *testing.T) {
 	if r, g, b := rgbAt(got, 128, 128); !whitePix(r, g, b) {
 		t.Fatalf("center %d,%d,%d", r, g, b)
 	}
+}
+
+func TestOCRRenderImagePixelBound(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.png")
+	out := filepath.Join(dir, "out.png")
+	if err := os.WriteFile(in, pngIHDR(11, 10), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	precreate(t, out)
+	var calls int
+	conv := OCRRenderConverter{OCRConverter: OCRConverter{
+		MaxImagePixels: 100,
+		run: func(context.Context, string, ...string) ([]byte, error) {
+			calls++
+			return nil, fmt.Errorf("called")
+		},
+	}}
+	err := conv.Convert(context.Background(), in, out, nil)
+	if !errors.Is(err, ErrOCRImageTooLarge) {
+		t.Fatalf("%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("calls %d", calls)
+	}
+	assertGone(t, out)
 }
 
 func TestOCRRenderTIFFOnePicture(t *testing.T) {
